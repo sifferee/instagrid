@@ -1,14 +1,15 @@
 """InstaGrid — FastAPI приложение."""
 from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from backend.database import init_db
-from backend.routers import niches, accounts, proxies
+from backend.routers import niches, accounts, proxies, content, posting, stories, checker
 
-app = FastAPI(title="InstaGrid", version="0.1.0")
+app = FastAPI(title="InstaGrid", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,11 +21,22 @@ app.add_middleware(
 app.include_router(niches.router)
 app.include_router(accounts.router)
 app.include_router(proxies.router)
+app.include_router(content.router)
+app.include_router(posting.router)
+app.include_router(stories.router)
+app.include_router(checker.router)
 
 
 @app.on_event("startup")
 def on_startup():
     init_db()
+    # Инициализация таблиц новых модулей
+    from backend.services.content_manager import init_content_tables
+    from backend.services.stories import init_stories_tables
+    from backend.services.checker import init_checker_tables
+    init_content_tables()
+    init_stories_tables()
+    init_checker_tables()
 
 
 # Serve React build

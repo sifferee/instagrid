@@ -9,3 +9,5 @@ geoip2
 pyotp
 
 httpx
+
+python-multipart
