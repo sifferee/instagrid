@@ -53,14 +53,13 @@ MAX_LOGIN_ATTEMPTS = 3              # неудач подряд → аккаун
 MAX_PROXY_RETRIES = 3               # попытки с разными прокси
 MAX_PAGE_RELOAD_RETRIES = 3         # попытки перезагрузки при лаге
 
-# Статусы аккаунтов
+# Статусы аккаунтов — должны совпадать с CHECK constraint в database.py
+# ('new', 'logged_in', 'cooldown', 'dead')
 class AccountStatus(str, Enum):
     NEW = "new"
     LOGGED_IN = "logged_in"
-    COOLDOWN = "cooldown"
-    DEAD = "dead"
-    INVALID_CREDENTIALS = "invalid_credentials"
-    CHALLENGE = "challenge"
+    COOLDOWN = "cooldown"          # challenge, временные ошибки
+    DEAD = "dead"                  # невалидные credentials, бан
 
 
 # ─── Селекторы Instagram ──────────────────────────────────────────────────────
@@ -200,7 +199,7 @@ class InstagramLogin:
                 login_ok = await self._wait_for_login_result(page, human, account)
 
                 if not login_ok:
-                    result.status = AccountStatus.INVALID_CREDENTIALS
+                    result.status = AccountStatus.DEAD
                     result.message = "Login failed — invalid credentials or challenge"
                     result.attempts = 1
                     return result
@@ -676,11 +675,11 @@ class LoginOrchestrator:
             consecutive_failures += 1
             last_result = result
 
-            if result.status == AccountStatus.CHALLENGE:
+            if "challenge" in result.message.lower():
                 # Challenge → cooldown 24ч, прокси НЕ удаляем (не его вина)
                 await self._update_status(
                     account["id"],
-                    AccountStatus.CHALLENGE.value,
+                    AccountStatus.COOLDOWN.value,
                     "Challenge required — cooldown 24h",
                 )
                 logger.warning("[%s] Challenge → cooldown", account["username"])
@@ -701,17 +700,17 @@ class LoginOrchestrator:
                 pause = 5.0 + attempt * 3.0
                 await asyncio.sleep(pause)
 
-        # Все попытки исчерпаны → аккаунт невалидный
+        # Все попытки исчерпаны → аккаунт невалидный (dead)
         await self._update_status(
             account["id"],
-            AccountStatus.INVALID_CREDENTIALS.value,
+            AccountStatus.DEAD.value,
             f"Failed {MAX_LOGIN_ATTEMPTS} attempts — likely invalid credentials",
         )
         logger.error(
-            "[%s] All %d login attempts failed — marked invalid",
+            "[%s] All %d login attempts failed — marked dead",
             account["username"], MAX_LOGIN_ATTEMPTS,
         )
-        last_result.status = AccountStatus.INVALID_CREDENTIALS
+        last_result.status = AccountStatus.DEAD
         return last_result
 
 
@@ -854,3 +853,134 @@ class LoginWorkerPool:
     def progress(self) -> tuple[int, int]:
         """Возвращает (processed, total)."""
         return self._processed_count, self._total_count
+
+
+# ─── DB-хелперы для LoginOrchestrator ─────────────────────────────────────────
+# Готовые async-обёртки над sync database.py для прямого использования.
+
+import functools
+
+from backend.database import execute, query_one, query
+
+
+def _run_sync(fn, *args):
+    """Запуск sync-функции в executor (SQLite не async)."""
+    loop = asyncio.get_event_loop()
+    return loop.run_in_executor(None, functools.partial(fn, *args))
+
+
+async def db_get_next_proxy(pool_id: int) -> dict[str, str] | None:
+    """
+    Атомарно берёт следующий свободный статический прокси из пула.
+    Возвращает {"id": ..., "server": "host:port", "username": ..., "password": ...}
+    или None если пул пуст.
+    """
+    row = await _run_sync(
+        query_one,
+        """SELECT id, host, port, username, password
+           FROM static_proxies
+           WHERE pool_id = ? AND status = 'available' AND account_id IS NULL
+           ORDER BY id ASC LIMIT 1""",
+        (pool_id,),
+    )
+    if not row:
+        return None
+
+    # Помечаем как занятый (атомарно)
+    await _run_sync(
+        execute,
+        "UPDATE static_proxies SET status = 'bound', used_at = unixepoch('now') WHERE id = ?",
+        (row["id"],),
+    )
+
+    return {
+        "id": row["id"],
+        "server": f"{row['host']}:{row['port']}",
+        "username": row["username"] or "",
+        "password": row["password"] or "",
+    }
+
+
+async def db_delete_proxy(proxy_id: int) -> None:
+    """Удаляет прокси навсегда (сгорел при неудачном логине)."""
+    await _run_sync(
+        execute,
+        "UPDATE static_proxies SET status = 'burned' WHERE id = ?",
+        (proxy_id,),
+    )
+
+
+async def db_update_account_status(
+    account_id: int, status: str, message: str | None = None,
+) -> None:
+    """Обновляет статус аккаунта + notes + timestamps."""
+    now_field = "last_login_at" if status == "logged_in" else "updated_at"
+    cooldown_sql = ""
+    params: list = [status]
+
+    if status == "cooldown":
+        # Cooldown 24 часа
+        cooldown_sql = ", cooldown_until = unixepoch('now') + 86400"
+
+    if message:
+        await _run_sync(
+            execute,
+            f"""UPDATE accounts
+                SET status = ?, notes = ?, {now_field} = unixepoch('now'),
+                    updated_at = unixepoch('now'){cooldown_sql}
+                WHERE id = ?""",
+            (status, message, account_id),
+        )
+    else:
+        await _run_sync(
+            execute,
+            f"""UPDATE accounts
+                SET status = ?, {now_field} = unixepoch('now'),
+                    updated_at = unixepoch('now'){cooldown_sql}
+                WHERE id = ?""",
+            (status, account_id),
+        )
+
+
+async def db_bind_proxy_to_account(account_id: int, proxy_id: int) -> None:
+    """Привязывает прокси к аккаунту после успешного логина."""
+    await _run_sync(
+        execute,
+        "UPDATE static_proxies SET account_id = ?, status = 'bound' WHERE id = ?",
+        (account_id, proxy_id),
+    )
+    await _run_sync(
+        execute,
+        "UPDATE accounts SET static_proxy_id = ? WHERE id = ?",
+        (proxy_id, account_id),
+    )
+
+
+async def db_get_accounts_for_login(niche_id: int | None = None) -> list[dict]:
+    """Возвращает список аккаунтов со статусом 'new' для логина."""
+    if niche_id:
+        return await _run_sync(
+            query,
+            """SELECT id, username, password, totp_secret
+               FROM accounts WHERE status = 'new' AND niche_id = ?
+               ORDER BY id ASC""",
+            (niche_id,),
+        )
+    return await _run_sync(
+        query,
+        """SELECT id, username, password, totp_secret
+           FROM accounts WHERE status = 'new'
+           ORDER BY id ASC""",
+        (),
+    )
+
+
+def create_orchestrator(profile_manager: ProfileManager) -> LoginOrchestrator:
+    """Фабрика: создаёт LoginOrchestrator с DB-хелперами."""
+    return LoginOrchestrator(
+        profile_manager=profile_manager,
+        get_next_proxy=db_get_next_proxy,
+        delete_proxy=db_delete_proxy,
+        update_account_status=db_update_account_status,
+        bind_proxy_to_account=db_bind_proxy_to_account,
+    )
