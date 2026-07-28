@@ -99,9 +99,36 @@ CREATE TABLE IF NOT EXISTS story_photos (
     created_at  REAL    NOT NULL DEFAULT (unixepoch('now'))
 );
 
+CREATE TABLE IF NOT EXISTS story_templates (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    link_url    TEXT    NOT NULL,
+    cta_text    TEXT    NOT NULL DEFAULT 'Learn More',
+    is_active   INTEGER NOT NULL DEFAULT 1,
+    created_at  REAL    NOT NULL DEFAULT (unixepoch('now'))
+);
+
+CREATE TABLE IF NOT EXISTS story_template_photos (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL REFERENCES story_templates(id) ON DELETE CASCADE,
+    photo_id    INTEGER NOT NULL REFERENCES story_photos(id) ON DELETE CASCADE,
+    UNIQUE(template_id, photo_id)
+);
+
+CREATE TABLE IF NOT EXISTS story_template_niches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER NOT NULL REFERENCES story_templates(id) ON DELETE CASCADE,
+    niche_id    INTEGER NOT NULL REFERENCES niches(id) ON DELETE CASCADE,
+    UNIQUE(template_id, niche_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_stories_account ON stories(account_id);
 CREATE INDEX IF NOT EXISTS idx_stories_status  ON stories(status);
 CREATE INDEX IF NOT EXISTS idx_story_photos_niche ON story_photos(niche_id);
+CREATE INDEX IF NOT EXISTS idx_story_templates_active ON story_templates(is_active);
+CREATE INDEX IF NOT EXISTS idx_story_template_photos_tmpl ON story_template_photos(template_id);
+CREATE INDEX IF NOT EXISTS idx_story_template_niches_tmpl ON story_template_niches(template_id);
+CREATE INDEX IF NOT EXISTS idx_story_template_niches_niche ON story_template_niches(niche_id);
 """
 
 
@@ -721,37 +748,112 @@ class StoryController:
 
         return result
 
+    async def get_template_for_account(self, account_id: int) -> dict | None:
+        """
+        Выбирает подходящий шаблон сторис для аккаунта.
+        Из активных шаблонов привязанных к нише (или ко всем) — случайный.
+        Из фото шаблона — случайное.
+        """
+        account = await _run_sync(
+            query_one,
+            "SELECT niche_id FROM accounts WHERE id = ?",
+            (account_id,),
+        )
+        if not account:
+            return None
+
+        niche_id = account.get("niche_id")
+
+        if niche_id:
+            templates = await _run_sync(
+                query,
+                """SELECT st.*
+                   FROM story_templates st
+                   WHERE st.is_active = 1
+                   AND (
+                       st.id IN (SELECT template_id FROM story_template_niches WHERE niche_id = ?)
+                       OR st.id NOT IN (SELECT template_id FROM story_template_niches)
+                   )""",
+                (niche_id,),
+            )
+        else:
+            templates = await _run_sync(
+                query,
+                "SELECT st.* FROM story_templates st WHERE st.is_active = 1",
+                (),
+            )
+
+        if not templates:
+            return None
+
+        # Случайный шаблон
+        template = random.choice(templates)
+
+        # Случайное фото из привязанных к шаблону
+        photos = await _run_sync(
+            query,
+            """SELECT sp.filepath as photo_path, sp.filename as photo_name
+               FROM story_template_photos stp
+               JOIN story_photos sp ON sp.id = stp.photo_id
+               WHERE stp.template_id = ?""",
+            (template["id"],),
+        )
+
+        if not photos:
+            return None
+
+        photo = random.choice(photos)
+        template["photo_path"] = photo["photo_path"]
+        template["photo_name"] = photo["photo_name"]
+
+        return template
+
     async def post_story_auto(
         self,
         account_id: int,
         context: BrowserContext,
         page: Page,
-        link_url: str = "",
-        cta_text: str = "Learn More",
         niche_id: int | None = None,
         proxy: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
-        Автопостинг: берёт фото из пула, постит сторис.
-        Используется автотриггером.
+        Автопостинг: берёт шаблон (фото + ссылка + CTA) и постит сторис.
+        Приоритет: шаблон > fallback на фото из пула.
         """
-        # Задержка для естественности
+        # Задержка для естественности (±20-30 мин)
         jitter = self.auto_trigger.get_jitter_seconds()
         logger.info("[account %d] Story auto-trigger, delay %.0f min", account_id, jitter / 60)
         await asyncio.sleep(jitter)
 
-        # Берём фото из пула
+        # Пробуем взять шаблон
+        template = await self.get_template_for_account(account_id)
+        if template:
+            logger.info(
+                "[account %d] Using template '%s' → %s",
+                account_id, template["name"], template["link_url"],
+            )
+            return await self.post_story(
+                account_id=account_id,
+                context=context,
+                page=page,
+                image_path=template["photo_path"],
+                link_url=template["link_url"],
+                cta_text=template["cta_text"],
+                proxy=proxy,
+            )
+
+        # Fallback: фото из пула без шаблона
         photo = await self.photo_pool.get_next_photo(niche_id)
         if not photo:
-            return {"success": False, "media_id": "", "error": "No photos in pool"}
+            return {"success": False, "media_id": "", "error": "No templates or photos in pool"}
 
         return await self.post_story(
             account_id=account_id,
             context=context,
             page=page,
             image_path=photo["filepath"],
-            link_url=link_url,
-            cta_text=cta_text,
+            link_url="",
+            cta_text="Learn More",
             proxy=proxy,
         )
 
