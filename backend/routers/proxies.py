@@ -31,7 +31,7 @@ class PoolUpdate(BaseModel):
 
 class ProxyBulkAdd(BaseModel):
     pool_id: int
-    data: str  # формат: host:port или host:port:user:pass, по строке
+    data: str  # формат: login:password@hostname:port, по строке
 
 
 # === Пулы прокси ===
@@ -120,7 +120,7 @@ def list_proxies(pool_id: int):
 
 @router.post("/bulk-add", status_code=201)
 def bulk_add_proxies(body: ProxyBulkAdd):
-    """Массовый импорт прокси: host:port или host:port:user:pass, по строке."""
+    """Массовый импорт прокси: login:password@hostname:port, по строке."""
     pool = query_one("SELECT * FROM proxy_pools WHERE id = ? AND pool_type = 'static'",
                      (body.pool_id,))
     if not pool:
@@ -134,18 +134,37 @@ def bulk_add_proxies(body: ProxyBulkAdd):
     errors = []
     with get_db() as conn:
         for i, line in enumerate(lines, 1):
-            parts = line.split(":")
-            if len(parts) < 2:
-                errors.append(f"Строка {i}: нужно host:port")
-                continue
-            host = parts[0].strip()
+            # Формат: login:password@hostname:port
+            if "@" in line:
+                creds, hostport = line.rsplit("@", 1)
+                if ":" not in creds or ":" not in hostport:
+                    errors.append(f"Строка {i}: неверный формат (нужно login:password@hostname:port)")
+                    continue
+                username, password = creds.split(":", 1)
+                host, port_str = hostport.rsplit(":", 1)
+            else:
+                # Fallback: host:port (без авторизации)
+                parts = line.split(":")
+                if len(parts) < 2:
+                    errors.append(f"Строка {i}: неверный формат")
+                    continue
+                host = parts[0].strip()
+                port_str = parts[1].strip()
+                username = None
+                password = None
+
             try:
-                port = int(parts[1].strip())
+                port = int(port_str.strip())
             except ValueError:
                 errors.append(f"Строка {i}: порт должен быть числом")
                 continue
-            username = parts[2].strip() if len(parts) >= 3 else None
-            password = parts[3].strip() if len(parts) >= 4 else None
+
+            host = host.strip()
+            if username:
+                username = username.strip()
+            if password:
+                password = password.strip()
+
             conn.execute(
                 "INSERT INTO static_proxies (pool_id, host, port, username, password) VALUES (?, ?, ?, ?, ?)",
                 (body.pool_id, host, port, username, password)

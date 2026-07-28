@@ -158,11 +158,11 @@ export default function ProxiesPage() {
               {showAddProxies && (
                 <div style={s.card}>
                   <div style={{ marginBottom: 8, fontSize: 13, color: '#8b949e' }}>
-                    Формат: <code>host:port</code> или <code>host:port:user:pass</code>, по строке
+                    Формат: <code>login:password@hostname:port</code>, по строке
                   </div>
                   <textarea
                     style={{ ...s.textarea, width: '100%', minHeight: 100 }}
-                    placeholder="1.2.3.4:8080&#10;5.6.7.8:3128:user:pass"
+                    placeholder="user1:pass1@gw.proxy.com:823&#10;user2:pass2@gw.proxy.com:823"
                     value={proxyData}
                     onChange={e => setProxyData(e.target.value)}
                   />
