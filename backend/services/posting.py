@@ -781,7 +781,6 @@ class PostingController:
             )
             if pool and pool["proxy_host"]:
                 # Fix #17: ротация мобильного прокси перед каждым профилем
-                rotator = MobileProxyRotator()
                 proxy_config = {
                     "server": f"{pool['proxy_host']}:{pool['proxy_port']}",
                     "username": pool["proxy_username"] or "",
@@ -789,15 +788,19 @@ class PostingController:
                 }
                 if pool["rotation_url"]:
                     try:
-                        await rotator.rotate_and_verify(
+                        rotator = MobileProxyRotator()
+                        result = await rotator.rotate_and_verify(
                             pool_id=pool["id"],
                             account_id=account["id"],
-                            rotation_url=pool["rotation_url"],
-                            proxy_config=proxy_config,
                         )
+                        if not result.success:
+                            logger.warning(
+                                "[%s] Mobile proxy rotation failed: %s",
+                                account["username"], result.message,
+                            )
                     except Exception as e:
                         logger.warning(
-                            "[%s] Mobile proxy rotation failed: %s",
+                            "[%s] Mobile proxy rotation error: %s",
                             account["username"], e,
                         )
                 return proxy_config

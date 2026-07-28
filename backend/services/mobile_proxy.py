@@ -17,7 +17,6 @@ InstaGrid — Ротация мобильных прокси.
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -25,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from backend.database import execute, query, query_one
+from backend.database import execute, query, query_one, run_sync
 
 logger = logging.getLogger("instagrid.mobile_proxy")
 
@@ -40,9 +39,8 @@ IP_CHECK_TIMEOUT = 15            # сек
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
-def _run_sync(fn, *args):
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, functools.partial(fn, *args))
+# run_sync импортирован из backend.database (Fix #7)
+_run_sync = run_sync
 
 
 # ─── Результат ротации ───────────────────────────────────────────────────────

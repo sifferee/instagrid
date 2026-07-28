@@ -2,6 +2,7 @@
 import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from backend.config import MOBILE_POOL_MAX_ACCOUNTS
 from backend.database import query, query_one, execute, get_db
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
@@ -20,6 +21,7 @@ class AccountUpdate(BaseModel):
     password: str | None = None
     totp_secret: str | None = None
     status: str | None = None
+    mobile_pool_id: int | None = None
     notes: str | None = None
 
 
@@ -118,9 +120,20 @@ def update_account(account_id: int, body: AccountUpdate):
 
     fields = []
     params = []
-    for field_name in ("niche_id", "username", "password", "totp_secret", "status", "notes"):
+    for field_name in ("niche_id", "username", "password", "totp_secret", "status", "mobile_pool_id", "notes"):
         value = getattr(body, field_name, None)
         if value is not None:
+            # Лимит 45 аккаунтов на мобильный пул
+            if field_name == "mobile_pool_id":
+                count = query_one(
+                    "SELECT COUNT(*) as cnt FROM accounts WHERE mobile_pool_id = ? AND id != ?",
+                    (value, account_id),
+                )
+                if count and count["cnt"] >= MOBILE_POOL_MAX_ACCOUNTS:
+                    raise HTTPException(
+                        400,
+                        f"Мобильный пул уже содержит {count['cnt']} аккаунтов (лимит {MOBILE_POOL_MAX_ACCOUNTS})",
+                    )
             fields.append(f"{field_name} = ?")
             params.append(value)
 
