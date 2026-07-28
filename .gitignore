@@ -6,4 +6,5 @@ logs/
 node_modules/
 frontend/dist/
 .env
+config.env
 *.db

@@ -12,8 +12,6 @@ InstaGrid — Контент-менеджер.
 
 from __future__ import annotations
 
-import asyncio
-import functools
 import hashlib
 import logging
 import shutil
@@ -21,14 +19,10 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from backend.database import execute, execute_many, query, query_one, get_db
+from backend.config import VIDEOS_DIR
+from backend.database import execute, execute_many, query, query_one, get_db, run_sync
 
 logger = logging.getLogger("instagrid.content")
-
-# ─── Константы ────────────────────────────────────────────────────────────────
-
-CONTENT_DIR = Path("content")
-VIDEOS_DIR = CONTENT_DIR / "videos"
 ALLOWED_VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 # Claude API для автогенерации описаний
@@ -85,10 +79,8 @@ def init_content_tables():
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
-def _run_sync(fn, *args):
-    """Запуск sync-функции в executor."""
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, functools.partial(fn, *args))
+# run_sync импортирован из backend.database (Fix #7)
+_run_sync = run_sync
 
 
 def _file_hash(filepath: Path) -> str:
@@ -412,10 +404,11 @@ class VideoManager:
         )
 
     async def mark_posted(self, video_id: int) -> None:
-        """Помечает видео как опубликованное."""
+        """Обновляет posted_at но оставляет status='assigned'.
+        Fix #1/#5: одно видео привязано к аккаунту навсегда, переиспользуется каждую сессию."""
         await _run_sync(
             execute,
-            "UPDATE videos SET status = 'posted', posted_at = unixepoch('now') WHERE id = ?",
+            "UPDATE videos SET posted_at = unixepoch('now') WHERE id = ?",
             (video_id,),
         )
 

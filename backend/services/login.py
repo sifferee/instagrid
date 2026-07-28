@@ -856,42 +856,29 @@ class LoginWorkerPool:
 
 
 # ─── DB-хелперы для LoginOrchestrator ─────────────────────────────────────────
-# Готовые async-обёртки над sync database.py для прямого использования.
 
-import functools
-
-from backend.database import execute, query_one, query
-
-
-def _run_sync(fn, *args):
-    """Запуск sync-функции в executor (SQLite не async)."""
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, functools.partial(fn, *args))
+from backend.database import execute, execute_atomic, query_one, query, run_sync
 
 
 async def db_get_next_proxy(pool_id: int) -> dict[str, str] | None:
     """
     Атомарно берёт следующий свободный статический прокси из пула.
-    Возвращает {"id": ..., "server": "host:port", "username": ..., "password": ...}
-    или None если пул пуст.
+    Fix #2: BEGIN IMMEDIATE + UPDATE...RETURNING в одном запросе.
     """
-    row = await _run_sync(
-        query_one,
-        """SELECT id, host, port, username, password
-           FROM static_proxies
-           WHERE pool_id = ? AND status = 'available' AND account_id IS NULL
-           ORDER BY id ASC LIMIT 1""",
+    row = await run_sync(
+        execute_atomic,
+        """UPDATE static_proxies
+           SET status = 'bound', used_at = unixepoch('now')
+           WHERE id = (
+               SELECT id FROM static_proxies
+               WHERE pool_id = ? AND status = 'available' AND account_id IS NULL
+               ORDER BY id ASC LIMIT 1
+           )
+           RETURNING id, host, port, username, password""",
         (pool_id,),
     )
     if not row:
         return None
-
-    # Помечаем как занятый (атомарно)
-    await _run_sync(
-        execute,
-        "UPDATE static_proxies SET status = 'bound', used_at = unixepoch('now') WHERE id = ?",
-        (row["id"],),
-    )
 
     return {
         "id": row["id"],
@@ -901,11 +888,11 @@ async def db_get_next_proxy(pool_id: int) -> dict[str, str] | None:
     }
 
 
-async def db_delete_proxy(proxy_id: int) -> None:
-    """Удаляет прокси навсегда (сгорел при неудачном логине)."""
-    await _run_sync(
+async def db_destroy_static_proxy(proxy_id: int) -> None:
+    """Fix #16: настоящий DELETE статического прокси. Сгорел — удаляем навсегда."""
+    await run_sync(
         execute,
-        "UPDATE static_proxies SET status = 'burned' WHERE id = ?",
+        "DELETE FROM static_proxies WHERE id = ?",
         (proxy_id,),
     )
 
@@ -916,14 +903,12 @@ async def db_update_account_status(
     """Обновляет статус аккаунта + notes + timestamps."""
     now_field = "last_login_at" if status == "logged_in" else "updated_at"
     cooldown_sql = ""
-    params: list = [status]
 
     if status == "cooldown":
-        # Cooldown 24 часа
         cooldown_sql = ", cooldown_until = unixepoch('now') + 86400"
 
     if message:
-        await _run_sync(
+        await run_sync(
             execute,
             f"""UPDATE accounts
                 SET status = ?, notes = ?, {now_field} = unixepoch('now'),
@@ -932,7 +917,7 @@ async def db_update_account_status(
             (status, message, account_id),
         )
     else:
-        await _run_sync(
+        await run_sync(
             execute,
             f"""UPDATE accounts
                 SET status = ?, {now_field} = unixepoch('now'),
@@ -944,12 +929,12 @@ async def db_update_account_status(
 
 async def db_bind_proxy_to_account(account_id: int, proxy_id: int) -> None:
     """Привязывает прокси к аккаунту после успешного логина."""
-    await _run_sync(
+    await run_sync(
         execute,
         "UPDATE static_proxies SET account_id = ?, status = 'bound' WHERE id = ?",
         (account_id, proxy_id),
     )
-    await _run_sync(
+    await run_sync(
         execute,
         "UPDATE accounts SET static_proxy_id = ? WHERE id = ?",
         (proxy_id, account_id),
@@ -959,14 +944,14 @@ async def db_bind_proxy_to_account(account_id: int, proxy_id: int) -> None:
 async def db_get_accounts_for_login(niche_id: int | None = None) -> list[dict]:
     """Возвращает список аккаунтов со статусом 'new' для логина."""
     if niche_id:
-        return await _run_sync(
+        return await run_sync(
             query,
             """SELECT id, username, password, totp_secret
                FROM accounts WHERE status = 'new' AND niche_id = ?
                ORDER BY id ASC""",
             (niche_id,),
         )
-    return await _run_sync(
+    return await run_sync(
         query,
         """SELECT id, username, password, totp_secret
            FROM accounts WHERE status = 'new'
@@ -980,7 +965,7 @@ def create_orchestrator(profile_manager: ProfileManager) -> LoginOrchestrator:
     return LoginOrchestrator(
         profile_manager=profile_manager,
         get_next_proxy=db_get_next_proxy,
-        delete_proxy=db_delete_proxy,
+        delete_proxy=db_destroy_static_proxy,
         update_account_status=db_update_account_status,
         bind_proxy_to_account=db_bind_proxy_to_account,
     )

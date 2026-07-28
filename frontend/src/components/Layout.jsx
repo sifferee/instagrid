@@ -7,6 +7,7 @@ const navItems = [
   { to: '/proxies', label: 'Прокси' },
   { to: '/content', label: 'Контент' },
   { to: '/posting', label: 'Постинг' },
+  { to: '/stories', label: 'Сторис' },
   { to: '/checker', label: 'Чекер' },
 ]
 

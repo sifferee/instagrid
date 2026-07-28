@@ -22,7 +22,6 @@ InstaGrid — Постинг рилсов.
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import random
 import time
@@ -32,10 +31,11 @@ from typing import Any, Callable, Coroutine
 
 from playwright.async_api import Page, TimeoutError as PwTimeout
 
-from backend.database import execute, query, query_one
+from backend.database import execute, query, query_one, run_sync
 from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
 from backend.services.content_manager import ContentManager
+from backend.services.mobile_proxy import MobileProxyRotator
 
 logger = logging.getLogger("instagrid.posting")
 
@@ -44,8 +44,9 @@ logger = logging.getLogger("instagrid.posting")
 
 INSTAGRAM_URL = "https://www.instagram.com/"
 
-# Таймауты
-HARD_TIMEOUT = 15 * 60                 # 15 мин на весь цикл аккаунта
+# Таймауты — Fix #4: динамический расчёт
+HARD_TIMEOUT_BASE = 5 * 60             # 5 мин базовое время (прогрев + открытие)
+HARD_TIMEOUT_PER_REEL = 6 * 60         # 6 мин на каждый рилс (прогрев 3мин + загрузка 2мин + запас)
 PAGE_LOAD_TIMEOUT = 30_000             # мс
 ELEMENT_WAIT_TIMEOUT = 10_000          # мс
 UPLOAD_CONFIRM_TIMEOUT = 120_000       # мс — ожидание загрузки видео на сервер
@@ -119,9 +120,8 @@ class PostResult:
 
 # ─── Утилиты БД ──────────────────────────────────────────────────────────────
 
-def _run_sync(fn, *args):
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, functools.partial(fn, *args))
+# run_sync импортирован из backend.database (Fix #7)
+_run_sync = run_sync
 
 
 async def _update_account_action(account_id: int) -> None:
@@ -412,7 +412,9 @@ class PostingSession:
         )
 
         try:
-            async with asyncio.timeout(HARD_TIMEOUT):
+            # Fix #4: динамический таймаут = base + per_reel × count
+            session_timeout = HARD_TIMEOUT_BASE + HARD_TIMEOUT_PER_REEL * self.reels_per_session
+            async with asyncio.timeout(session_timeout):
                 for i in range(1, self.reels_per_session + 1):
                     logger.info("[%s] Reel %d/%d", username, i, self.reels_per_session)
 
@@ -448,7 +450,7 @@ class PostingSession:
 
         except TimeoutError:
             result.status = PostStatus.TIMEOUT
-            result.message = f"Hard timeout {HARD_TIMEOUT}s"
+            result.message = f"Hard timeout {session_timeout}s"
             logger.error("[%s] Session timeout", username)
 
         except Exception as e:
@@ -754,7 +756,7 @@ class PostingController:
             )
 
     async def _get_account_proxy(self, account: dict) -> dict[str, str] | None:
-        """Получает прокси аккаунта из БД."""
+        """Получает прокси аккаунта из БД. Fix #17: мобильный — с ротацией."""
         proxy_id = account.get("static_proxy_id")
         if proxy_id:
             row = await _run_sync(
@@ -769,20 +771,36 @@ class PostingController:
                     "password": row["password"] or "",
                 }
 
-        # Мобильный пул
+        # Мобильный пул — ротация + проверка уникальности IP
         mobile_pool = account.get("mobile_pool_id")
         if mobile_pool:
             pool = await _run_sync(
                 query_one,
-                "SELECT proxy_host, proxy_port, proxy_username, proxy_password FROM proxy_pools WHERE id = ?",
+                "SELECT id, proxy_host, proxy_port, proxy_username, proxy_password, rotation_url FROM proxy_pools WHERE id = ?",
                 (mobile_pool,),
             )
             if pool and pool["proxy_host"]:
-                return {
+                # Fix #17: ротация мобильного прокси перед каждым профилем
+                rotator = MobileProxyRotator()
+                proxy_config = {
                     "server": f"{pool['proxy_host']}:{pool['proxy_port']}",
                     "username": pool["proxy_username"] or "",
                     "password": pool["proxy_password"] or "",
                 }
+                if pool["rotation_url"]:
+                    try:
+                        await rotator.rotate_and_verify(
+                            pool_id=pool["id"],
+                            account_id=account["id"],
+                            rotation_url=pool["rotation_url"],
+                            proxy_config=proxy_config,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] Mobile proxy rotation failed: %s",
+                            account["username"], e,
+                        )
+                return proxy_config
 
         return None
 

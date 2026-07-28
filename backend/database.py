@@ -1,5 +1,9 @@
 """InstaGrid — SQLite база данных с WAL-режимом.
 
+Fix #3:  Единый connection-per-thread, execute/query через run_in_executor
+         с threading.Lock для предотвращения concurrent writes.
+Fix #7:  asyncio.get_running_loop() вместо deprecated get_event_loop().
+
 Таблицы:
   niches           — группы аккаунтов
   accounts         — Instagram-аккаунты
@@ -8,16 +12,17 @@
   mobile_ip_history — история использованных мобильных IP
   logs             — события для дашборда
 """
+import asyncio
+import functools
 import sqlite3
 import threading
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
 from backend.config import DB_PATH
 
 _local = threading.local()
-_lock = threading.Lock()
+_write_lock = threading.Lock()
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -54,7 +59,7 @@ CREATE TABLE IF NOT EXISTS static_proxies (
     password    TEXT,
     account_id  INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
     status      TEXT    NOT NULL DEFAULT 'available'
-                        CHECK (status IN ('available', 'bound', 'burned')),
+                        CHECK (status IN ('available', 'bound')),
     created_at  REAL    NOT NULL DEFAULT (unixepoch('now')),
     used_at     REAL
 );
@@ -108,7 +113,7 @@ CREATE INDEX IF NOT EXISTS idx_logs_account         ON logs(account_id);
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Один коннект на поток, WAL, retry при locked."""
+    """Один коннект на поток, WAL, row_factory=Row."""
     conn = getattr(_local, "conn", None)
     if conn is not None:
         return conn
@@ -130,7 +135,7 @@ def init_db():
 
 @contextmanager
 def get_db():
-    """Context manager для работы с БД. Автокоммит при успехе, ролбэк при ошибке."""
+    """Context manager: автокоммит при успехе, ролбэк при ошибке."""
     conn = _get_conn()
     try:
         yield conn
@@ -141,30 +146,56 @@ def get_db():
 
 
 def query(sql: str, params: tuple = ()) -> list[dict]:
-    """SELECT — вернуть список словарей."""
+    """SELECT — список словарей. Потокобезопасен (read в WAL параллелен)."""
     conn = _get_conn()
     rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
 def query_one(sql: str, params: tuple = ()) -> dict | None:
-    """SELECT — вернуть один словарь или None."""
+    """SELECT — один словарь или None."""
     conn = _get_conn()
     row = conn.execute(sql, params).fetchone()
     return dict(row) if row else None
 
 
 def execute(sql: str, params: tuple = ()) -> int:
-    """INSERT/UPDATE/DELETE — вернуть lastrowid."""
-    conn = _get_conn()
-    cur = conn.execute(sql, params)
-    conn.commit()
-    return cur.lastrowid
+    """INSERT/UPDATE/DELETE — вернуть lastrowid. Захватывает write lock."""
+    with _write_lock:
+        conn = _get_conn()
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur.lastrowid
 
 
 def execute_many(sql: str, params_list: list[tuple]) -> int:
-    """Batch INSERT/UPDATE/DELETE."""
-    conn = _get_conn()
-    conn.executemany(sql, params_list)
-    conn.commit()
-    return len(params_list)
+    """Batch INSERT/UPDATE/DELETE. Захватывает write lock."""
+    with _write_lock:
+        conn = _get_conn()
+        conn.executemany(sql, params_list)
+        conn.commit()
+        return len(params_list)
+
+
+def execute_atomic(sql: str, params: tuple = ()) -> dict | None:
+    """BEGIN IMMEDIATE + execute + commit. Для атомарных UPDATE...RETURNING.
+    Возвращает первую строку результата или None."""
+    with _write_lock:
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(sql, params)
+            row = cur.fetchone()
+            conn.commit()
+            return dict(row) if row else None
+        except Exception:
+            conn.rollback()
+            raise
+
+
+# ─── Async-обёртка (Fix #7: get_running_loop) ───────────────────────────────
+
+def run_sync(fn, *args):
+    """Запуск sync DB-функции в executor. Используется всеми сервисами."""
+    loop = asyncio.get_running_loop()
+    return loop.run_in_executor(None, functools.partial(fn, *args))

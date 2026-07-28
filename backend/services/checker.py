@@ -14,7 +14,6 @@ InstaGrid — Чекер.
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import random
@@ -25,7 +24,7 @@ from typing import Any, Callable, Coroutine
 
 from playwright.async_api import Page, BrowserContext
 
-from backend.database import execute, execute_many, query, query_one, get_db
+from backend.database import execute, execute_many, query, query_one, get_db, run_sync
 from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
 
@@ -108,9 +107,8 @@ def init_checker_tables():
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
-def _run_sync(fn, *args):
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, functools.partial(fn, *args))
+# run_sync импортирован из backend.database (Fix #7)
+_run_sync = run_sync
 
 
 # ─── Результаты ──────────────────────────────────────────────────────────────
@@ -549,6 +547,13 @@ class CheckerController:
             human = HumanInteractor(page, checker["username"])
             parser = ProfileParser(page, human)
 
+            # Fix #19: сначала проверяем здоровье чекера (captcha/block → утиль)
+            checker_ok = await self._verify_checker_health(page, human, checker)
+            if not checker_ok:
+                await self.checker_pool.mark_banned(checker["id"])
+                logger.warning("Checker %s failed health check → discarded", checker["username"])
+                return results
+
             # Рандомизация порядка
             shuffled_ids = list(account_ids)
             random.shuffle(shuffled_ids)
@@ -578,8 +583,8 @@ class CheckerController:
                     await self.checker_pool.mark_banned(checker["id"])
                     break
 
-                # Пауза между проверками
-                await asyncio.sleep(random.uniform(3.0, 8.0))
+                # Fix #12: jitter 5-10 сек между аккаунтами (чтобы не связывать)
+                await asyncio.sleep(random.uniform(5.0, 10.0))
 
         except Exception as e:
             logger.exception("Manual check failed: %s", e)
@@ -658,6 +663,25 @@ class CheckerController:
         try:
             profile = await parser.parse_profile(target_username)
 
+            # Fix #19: проверяем не видим ли captcha/block/human-verify
+            page_text = await parser.page.inner_text("body")
+            block_signals = [
+                "Confirm your identity", "prove you're a human",
+                "Verify Your Identity", "challenge_required",
+                "Suspicious Login", "Confirm It's You",
+                "We've detected automated behavior",
+            ]
+            for signal in block_signals:
+                if signal.lower() in page_text.lower():
+                    logger.warning("Checker %s got '%s' → discarded", checker["username"], signal)
+                    return CheckResult(
+                        account_id=account_id,
+                        target_username=target_username,
+                        checker_username=checker["username"],
+                        success=False,
+                        message="checker_banned",
+                    )
+
             # Проверка: чекер сам забанен?
             if profile.is_banned:
                 # Может быть что целевой аккаунт забанен, а может чекер
@@ -698,7 +722,8 @@ class CheckerController:
                 ),
             )
 
-            # Сохраняем статистику рилсов
+            # Сохраняем статистику рилсов + Fix #12: проверяем порог для сторис
+            max_reel_views = 0
             for reel in profile.reels:
                 await _run_sync(
                     execute,
@@ -710,6 +735,30 @@ class CheckerController:
                         reel.views, reel.likes, reel.comments, checker["id"],
                     ),
                 )
+                if reel.views > max_reel_views:
+                    max_reel_views = reel.views
+
+            # Fix #12: если рилс набрал 10к+ просмотров → триггер сторис
+            if max_reel_views >= 10000 and not profile.is_banned:
+                try:
+                    from backend.services.stories import StoryAutoTrigger
+                    trigger = StoryAutoTrigger()
+                    if await trigger.should_post_story(account_id, max_reel_views):
+                        logger.info(
+                            "[%s] Reel hit %d views → story auto-trigger queued",
+                            target_username, max_reel_views,
+                        )
+                        # Сохраняем флаг для PostingController (или background task)
+                        await _run_sync(
+                            execute,
+                            """UPDATE accounts
+                               SET notes = 'STORY_TRIGGER:' || ?,
+                                   updated_at = unixepoch('now')
+                               WHERE id = ? AND status = 'logged_in'""",
+                            (str(max_reel_views), account_id),
+                        )
+                except Exception as e:
+                    logger.warning("Story trigger check failed for %s: %s", target_username, e)
 
             return CheckResult(
                 account_id=account_id,
@@ -731,6 +780,58 @@ class CheckerController:
                 success=False,
                 message=str(e),
             )
+
+    async def _verify_checker_health(
+        self,
+        page: Page,
+        human: HumanInteractor,
+        checker: dict,
+    ) -> bool:
+        """
+        Fix #19: Проверяет здоровье чекер-аккаунта ПЕРЕД парсингом целевых.
+        Заходит на instagram.com/instagram/ — если не видит профиль,
+        или видит captcha/block/human-verify → чекер в утиль.
+        """
+        try:
+            await page.goto(
+                "https://www.instagram.com/instagram/",
+                wait_until="domcontentloaded",
+                timeout=PAGE_LOAD_TIMEOUT,
+            )
+            await human.random_pause(2.0, 4.0)
+            page_text = await page.inner_text("body")
+
+            # Явные признаки блокировки чекера
+            block_signals = [
+                "Sorry, this page isn't available",
+                "Confirm your identity",
+                "prove you're a human",
+                "Verify Your Identity",
+                "We detected an unusual login",
+                "challenge_required",
+                "Suspicious Login",
+                "Confirm It's You",
+                "This page isn't available",
+                "We've detected automated behavior",
+            ]
+            for signal in block_signals:
+                if signal.lower() in page_text.lower():
+                    logger.warning(
+                        "Checker %s health FAILED: detected '%s'",
+                        checker["username"], signal,
+                    )
+                    return False
+
+            # Проверяем что видим профиль @instagram (подписчики > 0)
+            if "followers" not in page_text.lower() and "Followers" not in page_text:
+                logger.warning("Checker %s health FAILED: can't see @instagram profile", checker["username"])
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.warning("Checker %s health check exception: %s", checker["username"], e)
+            return False
 
     def _checker_proxy(self, checker: dict) -> dict[str, str] | None:
         """Собирает proxy dict из чекер-аккаунта."""

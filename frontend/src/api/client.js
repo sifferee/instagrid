@@ -28,6 +28,21 @@ async function uploadFile(path, file, extraFields = {}) {
 }
 
 export const api = {
+  // Generic
+  get: (path) => {
+    const fullUrl = path.startsWith('/api') ? path.replace('/api', '') : path
+    return request(fullUrl)
+  },
+  postForm: async (path, formData) => {
+    const url = path.startsWith('/api') ? path : '/api' + path
+    const res = await fetch(url, { method: 'POST', body: formData })
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(err.detail || res.statusText)
+    }
+    return res.json()
+  },
+
   // Ниши
   getNiches: () => request('/niches'),
   createNiche: (name) => request('/niches', { method: 'POST', body: JSON.stringify({ name }) }),

@@ -167,9 +167,6 @@ def _generate_control_points(
     nx, ny = -dy / dist, dx / dist
 
     # Случайное отклонение (bend) для каждой контрольной точки
-    for _ in range(2):
-        pass
-
     bend1 = random.uniform(bend_min, bend_max) * dist * random.choice([-1, 1])
     bend2 = random.uniform(bend_min, bend_max) * dist * random.choice([-1, 1])
 

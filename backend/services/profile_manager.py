@@ -28,11 +28,13 @@ from browserforge.fingerprints import FingerprintGenerator, Screen
 from camoufox import AsyncNewBrowser
 from playwright.async_api import BrowserContext, Page
 
+from backend.config import PROFILES_DIR as _CONFIG_PROFILES_DIR
+
 logger = logging.getLogger("instagrid.profile_manager")
 
 # ─── Константы ────────────────────────────────────────────────────────────────
 
-PROFILES_DIR = Path("profiles")
+PROFILES_DIR = _CONFIG_PROFILES_DIR
 FINGERPRINT_FILE = "fingerprint.json"
 META_FILE = "meta.json"
 

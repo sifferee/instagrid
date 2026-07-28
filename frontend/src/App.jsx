@@ -7,6 +7,7 @@ import ProxiesPage from './pages/ProxiesPage'
 import ContentPage from './pages/ContentPage'
 import PostingPage from './pages/PostingPage'
 import CheckerPage from './pages/CheckerPage'
+import StoriesPage from './pages/StoriesPage'
 
 export default function App() {
   return (
@@ -18,6 +19,7 @@ export default function App() {
           <Route path="/proxies" element={<ProxiesPage />} />
           <Route path="/content" element={<ContentPage />} />
           <Route path="/posting" element={<PostingPage />} />
+          <Route path="/stories" element={<StoriesPage />} />
           <Route path="/checker" element={<CheckerPage />} />
         </Routes>
       </Layout>

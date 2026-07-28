@@ -18,7 +18,6 @@ InstaGrid — Сторис через Instagram Web Private API.
 from __future__ import annotations
 
 import asyncio
-import functools
 import hashlib
 import io
 import json
@@ -35,7 +34,8 @@ import httpx
 from PIL import Image, ImageDraw, ImageFont
 from playwright.async_api import BrowserContext, Page
 
-from backend.database import execute, query, query_one
+from backend.config import STORY_PHOTOS_DIR
+from backend.database import execute, query, query_one, run_sync
 
 logger = logging.getLogger("instagrid.stories")
 
@@ -67,7 +67,7 @@ STORY_COOLDOWN_HOURS = 24
 STORY_JITTER_MINUTES = 20      # ±10-20 мин разброс
 
 # Фото пул
-PHOTOS_DIR = Path("content") / "story_photos"
+PHOTOS_DIR = STORY_PHOTOS_DIR
 ALLOWED_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -114,9 +114,8 @@ def init_stories_tables():
 
 # ─── Утилиты ─────────────────────────────────────────────────────────────────
 
-def _run_sync(fn, *args):
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(None, functools.partial(fn, *args))
+# run_sync импортирован из backend.database (Fix #7)
+_run_sync = run_sync
 
 
 # ─── Извлечение кук/UA из BrowserContext ──────────────────────────────────────
