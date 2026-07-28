@@ -5,6 +5,9 @@ const navItems = [
   { to: '/', label: 'Ниши' },
   { to: '/accounts', label: 'Аккаунты' },
   { to: '/proxies', label: 'Прокси' },
+  { to: '/content', label: 'Контент' },
+  { to: '/posting', label: 'Постинг' },
+  { to: '/checker', label: 'Чекер' },
 ]
 
 export default function Layout({ children }) {
