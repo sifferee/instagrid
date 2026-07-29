@@ -249,6 +249,40 @@ class GeoIPResolver:
             self._reader = None
 
 
+def _geoip_available() -> bool:
+    """
+    Доступен ли нативный geoip Camoufox.
+
+    geoip=True требует maxminddb (тянется вместе с geoip2) и скачанную базу
+    Camoufox. Если чего-то нет — Camoufox бросает исключение на КАЖДОМ запуске
+    профиля. Проверяем один раз и при проблеме тихо откатываемся на ручной
+    timezone_id, вместо того чтобы уронить весь постинг.
+
+    Чтобы включить нативный geoip на сервере:
+        python -m camoufox fetch
+    """
+    global _GEOIP_OK
+    if _GEOIP_OK is not None:
+        return _GEOIP_OK
+    try:
+        from camoufox.geolocation import geoip_allowed
+        geoip_allowed()
+        _GEOIP_OK = True
+        logger.info("Camoufox native geoip: available")
+    except Exception as e:
+        _GEOIP_OK = False
+        logger.warning(
+            "Camoufox native geoip unavailable (%s). "
+            "Falling back to manual timezone. Run `python -m camoufox fetch` "
+            "on the server to enable coherent timezone/locale/WebRTC by proxy IP.",
+            type(e).__name__,
+        )
+    return _GEOIP_OK
+
+
+_GEOIP_OK: bool | None = None
+
+
 # ─── Fingerprint ──────────────────────────────────────────────────────────────
 
 def generate_fingerprint(
@@ -590,11 +624,9 @@ class ProfileManager:
             "fingerprint": fingerprint,
 
             # ── GeoIP: timezone/locale/geolocation/WebRTC по IP прокси ──
+            # Ставится ниже, в зависимости от доступности (см. _geoip_available).
             # Camoufox сам определяет exit-IP через прокси и делает
             # согласованными timezone, язык, координаты и WebRTC-адрес.
-            # Ручной timezone_id этого не даёт: Intl, Date.getTimezoneOffset
-            # и геолокация расходятся между собой.
-            "geoip": True,
 
             # WebRTC НЕ блокируем: у настоящего Firefox он есть, полное
             # отсутствие само по себе аномалия. При geoip=True Camoufox
@@ -622,6 +654,15 @@ class ProfileManager:
 
         if proxy:
             launch_kwargs["proxy"] = proxy
+            if _geoip_available():
+                launch_kwargs["geoip"] = True
+            else:
+                # Отката ради: своя GeoIP-база + ручные timezone/locale.
+                # Хуже, чем нативный geoip (Intl и геолокация могут
+                # расходиться), но работает и не роняет запуск.
+                launch_kwargs["geoip"] = False
+                launch_kwargs["locale"] = DEFAULT_LOCALE
+                launch_kwargs["timezone_id"] = timezone_id
         else:
             # Без прокси geoip=True полезет за реальным IP сервера
             launch_kwargs["geoip"] = False
