@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS static_proxies (
     password    TEXT,
     protocol    TEXT    NOT NULL DEFAULT 'http'
                         CHECK (protocol IN ('http', 'https', 'socks5')),
+    fail_count  INTEGER NOT NULL DEFAULT 0,
     account_id  INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
     status      TEXT    NOT NULL DEFAULT 'available'
                         CHECK (status IN ('available', 'bound')),
@@ -148,6 +149,28 @@ def init_db():
         if "proxy_pool_id" not in cols:
             conn.execute("ALTER TABLE niches ADD COLUMN proxy_pool_id INTEGER REFERENCES proxy_pools(id) ON DELETE SET NULL")
             conn.commit()
+    except Exception:
+        pass
+    # Миграция: счётчик неудачных проверок прокси
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(static_proxies)")}
+        if "fail_count" not in cols:
+            conn.execute("ALTER TABLE static_proxies ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+    except Exception:
+        pass
+    # Подчистка сирот: прокси остался 'bound', а аккаунта уже нет.
+    # Через интерфейс такой прокси удаляется вместе с аккаунтом, но при
+    # удалении напрямую в БД срабатывает ON DELETE SET NULL — и адрес
+    # повисает: выдать нельзя (status != available), удалить некому.
+    try:
+        cur = conn.execute(
+            "DELETE FROM static_proxies "
+            "WHERE status = 'bound' AND account_id IS NULL"
+        )
+        if cur.rowcount:
+            conn.commit()
+            print(f"  Удалено осиротевших прокси: {cur.rowcount}")
     except Exception:
         pass
 

@@ -783,14 +783,21 @@ class LoginOrchestrator:
 
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
             # Получаем прокси
-            proxy_data = await self._get_next_proxy(proxy_pool_id)
+            # Берём прокси, который реально отвечает. Проверка занимает
+            # до 5 секунд и делается ДО запуска браузера — раньше мёртвый
+            # адрес выяснялся только после полного цикла Camoufox.
+            # Три неудачи подряд → прокси удаляется из пула.
+            from backend.services.proxy_health import acquire_working_proxy
+            proxy_data = await acquire_working_proxy(
+                proxy_pool_id, self._get_next_proxy,
+            )
             if not proxy_data:
-                last_result.message = "No available proxies in pool"
+                last_result.message = "No working proxies in pool"
                 last_result.status = AccountStatus.COOLDOWN
                 await self._update_status(
                     account["id"],
                     AccountStatus.COOLDOWN.value,
-                    "No proxies available",
+                    "No working proxies available",
                 )
                 return last_result
 
