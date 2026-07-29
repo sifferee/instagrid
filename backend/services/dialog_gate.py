@@ -161,6 +161,87 @@ def _make_semantic_action_js(wanted_text: str) -> str:
     }}"""
 
 
+def _make_page_click_js(wanted_text: str) -> str:
+    """
+    Генерирует JS для клика по видимой кнопке ГДЕ УГОДНО на странице
+    (не только внутри диалога). Нужно для полностраничных экранов вроде
+    "Continue as <username>" — это не [role='dialog'], а обычный контент
+    страницы, обычный _semantic_action его не найдёт.
+    """
+    return f"""() => {{
+      const visible = (el) => {{ const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+        return r.width>8 && r.height>8 && s.display!=='none' && s.visibility!=='hidden' &&
+          s.opacity!=='0' && r.bottom>0 && r.right>0 && r.top<innerHeight && r.left<innerWidth; }};
+      const label=(el)=>String(el.getAttribute('aria-label')||el.innerText||el.textContent||'').replace(/\\s+/g,' ').trim().toLowerCase();
+      const wanted={wanted_text!r};
+      const candidates=[...document.querySelectorAll('button,[role="button"],a,[aria-label]')];
+      const target=candidates.find(el=>visible(el) && label(el)===wanted);
+      if(!target) return false;
+      target.click(); return true;
+    }}"""
+
+
+async def click_button_by_text(page, text: str) -> bool:
+    """Кликает первую видимую кнопку/ссылку с точным текстом ГДЕ УГОДНО на странице."""
+    try:
+        return bool(await page.evaluate(_make_page_click_js(text.strip().lower())))
+    except Exception:
+        return False
+
+
+# ─── Диагностика неизвестного состояния страницы ────────────────────────────
+
+async def diagnose_unknown_state(page, username: str, tag: str) -> None:
+    """
+    Снимает скриншот + текст страницы, когда встретилось что-то незнакомое
+    (unknown_dialog, не удалось восстановить сессию и т.п.).
+
+    Сохраняет в logs/screenshots/ — это и есть тот самый "сбор данных на будущее":
+    периодически просматривай эту папку, и по накопленным примерам можно будет
+    дописать новую категорию прямо в _INSPECT_JS выше.
+
+    Портировано из login.py::_diagnose_page (там уже проверено на практике),
+    здесь — как отдельная переиспользуемая функция для posting.py и других мест.
+    """
+    from pathlib import Path as _P
+    import time as _t
+
+    try:
+        shots = _P("logs") / "screenshots"
+        shots.mkdir(parents=True, exist_ok=True)
+        stamp = _t.strftime("%Y%m%d_%H%M%S")
+        shot = shots / f"{stamp}_{username}_{tag}.png"
+        await page.screenshot(path=str(shot), full_page=False)
+        logger.warning("[%s] Unknown state screenshot: %s", username, shot)
+    except Exception as e:
+        logger.debug("[%s] Screenshot failed: %s", username, e)
+
+    try:
+        info = await page.evaluate("""() => {
+            const vis = (el) => {
+                const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                return r.width > 4 && r.height > 4 && s.display !== 'none' &&
+                       s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.05;
+            };
+            const clean = (t) => String(t || '').replace(/\\s+/g, ' ').trim();
+            const buttons = [...document.querySelectorAll('button,[role="button"],a')]
+                .filter(vis).map(e => clean(e.getAttribute('aria-label') || e.innerText)).filter(t => t.length > 0);
+            return {
+                title: clean(document.title),
+                url: location.href,
+                bodyStart: clean(document.body ? document.body.innerText : '').slice(0, 400),
+                buttons: [...new Set(buttons)].slice(0, 15),
+            };
+        }""")
+        logger.warning("[%s] -- ДИАГНОСТИКА НЕИЗВЕСТНОГО СОСТОЯНИЯ (%s) --", username, tag)
+        logger.warning("[%s]   url     : %s", username, str(info.get("url", ""))[:120])
+        logger.warning("[%s]   title   : %s", username, str(info.get("title", ""))[:90])
+        logger.warning("[%s]   buttons : %s", username, info.get("buttons", []))
+        logger.warning("[%s]   body    : %s", username, str(info.get("bodyStart", ""))[:300])
+    except Exception as e:
+        logger.debug("[%s] Page diagnostics failed: %s", username, e)
+
+
 # ─── Public API ──────────────────────────────────────────────────────────────
 
 async def inspect_dialog(page) -> dict[str, Any]:

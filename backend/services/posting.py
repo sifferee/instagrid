@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine
 
+import pyotp
 from playwright.async_api import Page, TimeoutError as PwTimeout
 
 from backend.database import execute, query, query_one, run_sync
@@ -39,8 +40,9 @@ from backend.services.content_manager import ContentManager
 from backend.services.mobile_proxy import MobileProxyRotator
 from backend.services.scheduler import is_within_active_window, next_session_at
 from backend.services.dialog_gate import (
-    inspect_dialog, continue_after_dialog,
-    NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL,
+    inspect_dialog, continue_after_dialog, verify_authenticated,
+    click_button_by_text, diagnose_unknown_state,
+    NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL, UNKNOWN_BLOCKER,
 )
 
 logger = logging.getLogger("instagrid.posting")
@@ -51,7 +53,8 @@ logger = logging.getLogger("instagrid.posting")
 async def _clear_blocking_dialogs(page, username: str, wait_seconds: float = 6.0) -> None:
     """
     Закрывает известные блокирующие попапы (cookie consent, save login info,
-    turn on notifications) перед тем как бот начнёт кликать по странице.
+    turn on notifications, "мы удалили твой пост") перед тем как бот начнёт
+    кликать по странице.
 
     Раньше dialog_gate вызывался только один раз — после Share, чтобы
     подтвердить успешную публикацию. Между заходом на страницу и этим
@@ -59,22 +62,101 @@ async def _clear_blocking_dialogs(page, username: str, wait_seconds: float = 6.0
     в них: клики по ленте/кнопке "+" утыкались в оверлей попапа, а не
     в реальный элемент под ним.
 
-    policy_notice/checkpoint/restriction/suspended сюда не входят —
-    это не мусорные попапы, а важные сигналы (например, снесли пост),
-    их лучше показать оператору в логе, а не тихо закрыть.
+    policy_notice ("We removed your post") теперь тоже закрывается —
+    иначе на 3-4 день постинга бот встаёт колом при первом же удалённом
+    посте. Но при этом громко логируется — это важный сигнал, а не мусор,
+    просто он не должен останавливать работу.
+
+    Неизвестные попапы (unknown_dialog) — не кликаем наугад, вместо этого
+    сохраняем скриншот + текст в logs/screenshots/, чтобы потом дописать
+    для них категорию в dialog_gate._INSPECT_JS.
     """
     try:
-        result = await continue_after_dialog(page, allow_safe_close=False, wait_seconds=wait_seconds)
+        result = await continue_after_dialog(page, allow_safe_close=True, wait_seconds=wait_seconds)
         outcome = result.get("outcome", "")
+
         if outcome == HANDLED_REEVALUATE:
-            logger.info("[%s] Dismissed blocking dialog before proceeding", username)
+            category = result.get("clicked_category", "")
+            if category == "policy_notice":
+                logger.warning(
+                    "[%s] ⚠ Instagram removed an earlier post (policy_notice) — dismissed, continuing",
+                    username,
+                )
+            else:
+                logger.info("[%s] Dismissed blocking dialog (%s) before proceeding", username, category)
+
         elif outcome == TERMINAL_MANUAL:
             logger.warning(
                 "[%s] Blocking dialog present, not auto-dismissed (state=%s) — needs manual look",
                 username, result.get("state"),
             )
+            await diagnose_unknown_state(page, username, "terminal_manual_dialog")
+
+        elif outcome == UNKNOWN_BLOCKER:
+            logger.warning("[%s] Unknown popup blocking the page — collecting diagnostics", username)
+            await diagnose_unknown_state(page, username, "unknown_dialog")
+
     except Exception as e:
         logger.debug("[%s] Dialog gate check failed: %s", username, e)
+
+
+# ─── Восстановление сессии, если аккаунт выкинуло ───────────────────────────
+
+async def _recover_logged_out_session(page, human, account: dict[str, Any]) -> bool:
+    """
+    Проверяет, не разлогинило ли аккаунт посреди работы (экран
+    "Continue as <username>" → запрос пароля → иногда снова 2FA),
+    и пытается восстановить сессию не открывая новый профиль/браузер.
+
+    Это отдельный случай от dialog_gate — тот экран не модалка (не
+    [role='dialog']), это обычная страница, поэтому обычная проверка
+    попапов его не видит вообще.
+
+    Returns:
+        True — можно продолжать (либо уже авторизован, либо восстановили).
+        False — не получилось восстановить, дальше вести сессию нет смысла.
+    """
+    username = human.username
+
+    auth = await verify_authenticated(page)
+    if auth["confirmed"]:
+        return True
+
+    logger.warning("[%s] Session looks logged out mid-run, attempting recovery", username)
+
+    # Экран "Continue as <username>" — жмём Continue, если он есть
+    await click_button_by_text(page, "continue")
+    await human.random_pause(1.0, 2.0)
+
+    # Если выпало поле пароля — вводим
+    pwd_selector = 'input[name="password"], input[name="pass"], input[type="password"]'
+    pwd_field = await page.query_selector(pwd_selector)
+    if pwd_field:
+        logger.info("[%s] Password prompt detected, entering password", username)
+        await human.clear_and_type(pwd_selector, account["password"])
+        await human.random_pause(0.5, 1.2)
+        await page.keyboard.press("Enter")
+        await human.random_pause(3.0, 5.0)
+
+        # 2FA может всплыть и здесь
+        code_selector = 'input[name="verificationCode"], input[name="approvals_code"], input[name="code"]'
+        code_field = await page.query_selector(code_selector)
+        if code_field and account.get("totp_secret"):
+            logger.info("[%s] 2FA prompt during recovery, entering TOTP", username)
+            code = pyotp.TOTP(account["totp_secret"]).now()
+            await human.clear_and_type(code_selector, code)
+            await human.random_pause(0.5, 1.0)
+            await page.keyboard.press("Enter")
+            await human.random_pause(3.0, 5.0)
+
+    auth = await verify_authenticated(page)
+    if auth["confirmed"]:
+        logger.info("[%s] Session recovered", username)
+        return True
+
+    logger.error("[%s] Could not recover logged-out session", username)
+    await diagnose_unknown_state(page, username, "relogin_failed")
+    return False
 
 
 # ─── Константы ────────────────────────────────────────────────────────────────
@@ -148,6 +230,7 @@ class PostStatus(str, Enum):
     SKIPPED = "skipped"
     TIMEOUT = "timeout"
     NO_CONTENT = "no_content"
+    LOGGED_OUT = "logged_out"
 
 
 @dataclass
@@ -556,6 +639,14 @@ class PostingSession:
 
                     # Прогрев перед каждым рилсом
                     await self.warmer.warmup()
+
+                    # На случай если за это время (или с самого начала) сессию
+                    # разлогинило — проверяем и пробуем восстановиться без
+                    # открытия нового профиля/браузера
+                    if not await _recover_logged_out_session(self.page, self.human, self.account):
+                        result.status = PostStatus.LOGGED_OUT
+                        result.message = "Session logged out, could not recover"
+                        break
 
                     # Получаем контент
                     content = await self.cm.get_posting_content(account_id)
