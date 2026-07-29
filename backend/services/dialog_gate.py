@@ -191,7 +191,37 @@ async def click_button_by_text(page, text: str) -> bool:
 
 # ─── Диагностика неизвестного состояния страницы ────────────────────────────
 
-async def diagnose_unknown_state(page, username: str, tag: str) -> None:
+def _seen_fingerprints_path():
+    from pathlib import Path as _P
+    return _P("logs") / "screenshots" / "seen_fingerprints.txt"
+
+
+def _already_captured(fingerprint: str) -> bool:
+    """Проверяет, снимали ли уже скрин именно для этого отпечатка попапа."""
+    if not fingerprint:
+        return False
+    path = _seen_fingerprints_path()
+    if not path.exists():
+        return False
+    try:
+        return fingerprint in set(path.read_text(encoding="utf-8").splitlines())
+    except Exception:
+        return False
+
+
+def _mark_captured(fingerprint: str) -> None:
+    if not fingerprint:
+        return
+    path = _seen_fingerprints_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(fingerprint + "\n")
+    except Exception:
+        pass
+
+
+async def diagnose_unknown_state(page, username: str, tag: str, fingerprint: str = "") -> None:
     """
     Снимает скриншот + текст страницы, когда встретилось что-то незнакомое
     (unknown_dialog, не удалось восстановить сессию и т.п.).
@@ -200,9 +230,21 @@ async def diagnose_unknown_state(page, username: str, tag: str) -> None:
     периодически просматривай эту папку, и по накопленным примерам можно будет
     дописать новую категорию прямо в _INSPECT_JS выше.
 
+    Если передан fingerprint и точно такой же попап уже был сфотографирован
+    раньше (в т.ч. на другом аккаунте — текст попапа не зависит от аккаунта) —
+    новый скрин не делается, только короткая строка в лог. Так не копится
+    гора одинаковых картинок с одним и тем же незнакомым попапом.
+
     Портировано из login.py::_diagnose_page (там уже проверено на практике),
     здесь — как отдельная переиспользуемая функция для posting.py и других мест.
     """
+    if fingerprint and _already_captured(fingerprint):
+        logger.info(
+            "[%s] Уже видели этот попап раньше (fingerprint=%s...), скрин уже есть, пропускаю",
+            username, fingerprint[:10],
+        )
+        return
+
     from pathlib import Path as _P
     import time as _t
 
@@ -240,6 +282,8 @@ async def diagnose_unknown_state(page, username: str, tag: str) -> None:
         logger.warning("[%s]   body    : %s", username, str(info.get("bodyStart", ""))[:300])
     except Exception as e:
         logger.debug("[%s] Page diagnostics failed: %s", username, e)
+
+    _mark_captured(fingerprint)
 
 
 # ─── Public API ──────────────────────────────────────────────────────────────
@@ -424,6 +468,7 @@ async def continue_after_dialog(
                         "state": "blocking_dialog_not_dismissed",
                         "present": True, "dismissed": False,
                         "fresh_reads": fresh_reads, "stable_reads": stable_reads,
+                        "fingerprint": fingerprint,
                     }
             else:
                 clicked_fingerprints.add(click_key)
@@ -433,6 +478,7 @@ async def continue_after_dialog(
                         "state": "blocking_dialog_not_dismissed",
                         "present": True, "dismissed": False,
                         "fresh_reads": fresh_reads, "stable_reads": 0,
+                        "fingerprint": fingerprint,
                     }
                 handled = True
                 clicked_at = time.time()
@@ -454,6 +500,7 @@ async def continue_after_dialog(
                 }[category],
                 "present": True, "dismissed": handled,
                 "fresh_reads": fresh_reads, "stable_reads": 1,
+                "fingerprint": str(observed.get("fingerprint") or category),
             }
 
         else:

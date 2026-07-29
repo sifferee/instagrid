@@ -90,11 +90,17 @@ async def _clear_blocking_dialogs(page, username: str, wait_seconds: float = 6.0
                 "[%s] Blocking dialog present, not auto-dismissed (state=%s) — needs manual look",
                 username, result.get("state"),
             )
-            await diagnose_unknown_state(page, username, "terminal_manual_dialog")
+            await diagnose_unknown_state(
+                page, username, "terminal_manual_dialog",
+                fingerprint=result.get("fingerprint", ""),
+            )
 
         elif outcome == UNKNOWN_BLOCKER:
             logger.warning("[%s] Unknown popup blocking the page — collecting diagnostics", username)
-            await diagnose_unknown_state(page, username, "unknown_dialog")
+            await diagnose_unknown_state(
+                page, username, "unknown_dialog",
+                fingerprint=result.get("fingerprint", ""),
+            )
 
     except Exception as e:
         logger.debug("[%s] Dialog gate check failed: %s", username, e)
