@@ -321,9 +321,9 @@ class HumanInteractor:
 
         await self.click_at(x, y)
 
-    async def click_selector(self, selector: str) -> None:
+    async def click_selector(self, selector: str, timeout: int = 30_000) -> None:
         """Находит элемент по селектору и кликает по нему."""
-        element = await self.page.wait_for_selector(selector, timeout=10_000)
+        element = await self.page.wait_for_selector(selector, timeout=timeout)
         if not element:
             raise ValueError(f"Selector not found: {selector}")
         await self.click_element(element)

@@ -43,7 +43,7 @@ INSTAGRAM_PRIVACY_URL = "https://www.instagram.com/accounts/privacy_and_security
 
 # Таймауты
 PAGE_LOAD_TIMEOUT = 30_000          # мс — ожидание загрузки страницы
-ELEMENT_WAIT_TIMEOUT = 10_000       # мс — ожидание элемента
+ELEMENT_WAIT_TIMEOUT = 30_000       # мс — ожидание элемента (через прокси дольше)
 HARD_TIMEOUT = 15 * 60             # сек — 15 мин на весь цикл аккаунта
 PROXY_LAG_TIMEOUT = 30              # сек — нет ответа = лаг прокси
 PROXY_LAG_RETRY_PAUSE = 150        # сек — пауза если прокси жив, но IG не грузит
@@ -67,14 +67,14 @@ class AccountStatus(str, Enum):
 class Selectors:
     """CSS-селекторы элементов Instagram (web, desktop view)."""
 
-    # Логин-форма
-    USERNAME_INPUT = 'input[name="username"]'
-    PASSWORD_INPUT = 'input[name="password"]'
-    LOGIN_BUTTON = 'button[type="submit"]'
+    # Логин-форма (Instagram меняет name: username→email, password→pass)
+    USERNAME_INPUT = 'input[name="username"], input[name="email"], input[type="text"][autocomplete="username"]'
+    PASSWORD_INPUT = 'input[name="password"], input[name="pass"], input[type="password"]'
+    LOGIN_BUTTON = '[type="submit"]'
 
     # 2FA
-    SECURITY_CODE_INPUT = 'input[name="verificationCode"]'
-    CONFIRM_2FA_BUTTON = 'form button[type="button"]'  # "Confirm" button on 2FA page
+    SECURITY_CODE_INPUT = 'input[name="verificationCode"], input[name="approvals_code"], input[name="code"], input[aria-label="Code"], input[placeholder="Code"]'
+    CONFIRM_2FA_BUTTON = '//button[contains(text(), "Continue") or contains(text(), "Confirm") or contains(text(), "Submit")]'
 
     # Попапы после логина
     SAVE_INFO_NOT_NOW = '//button[contains(text(), "Not Now") or contains(text(), "Not now")]'
@@ -337,12 +337,12 @@ class InstagramLogin:
         logger.info("[%s] Entering password", username)
         await human.clear_and_type(Selectors.PASSWORD_INPUT, password)
 
-        # Пауза перед кликом на кнопку Login
+        # Пауза перед нажатием Login
         await human.random_pause(0.6, 1.8)
 
-        # Клик по кнопке Log In
-        await human.click_selector(Selectors.LOGIN_BUTTON)
-        logger.info("[%s] Clicked login button", username)
+        # Нажимаем Enter — самый надёжный способ отправить форму (как человек)
+        await page.keyboard.press("Enter")
+        logger.info("[%s] Pressed Enter to submit login", username)
 
     # ── Ожидание результата логина + 2FA ──────────────────────────────────
 
@@ -353,52 +353,56 @@ class InstagramLogin:
         account: dict[str, Any],
     ) -> bool:
         """
-        Ждёт результата после нажатия Login:
-        - Ошибка → return False
-        - 2FA форма → вводим код → проверяем
-        - Успех → return True
+        Ждёт результата после нажатия Login.
+        Стратегия: ждём пока URL изменится с login page, потом определяем что произошло.
         """
-        await human.random_pause(2.0, 4.0)
+        login_url = page.url
 
-        # Проверяем ошибки
+        # Ждём пока URL изменится (redirect после логина)
+        for _ in range(30):  # макс 30 сек
+            await asyncio.sleep(1)
+            current_url = page.url
+            if current_url != login_url:
+                break
+
+        await human.random_pause(1.0, 2.0)
+        current_url = page.url
+        logger.info("[%s] Post-login URL: %s", human.username, current_url[:100])
+
+        # 2FA
+        if "two_step_verification" in current_url or "two_factor" in current_url:
+            logger.info("[%s] 2FA page detected", human.username)
+            return await self._handle_2fa(page, human, account)
+
+        # Challenge
+        if "challenge" in current_url:
+            logger.warning("[%s] Challenge required", human.username)
+            return False
+
+        # Suspicious
+        if "suspicious" in current_url.lower():
+            logger.warning("[%s] Suspicious login", human.username)
+            return False
+
+        # Уже на главной (успех)
+        if "/accounts/" not in current_url and "login" not in current_url:
+            logger.info("[%s] Appears logged in (URL: %s)", human.username, current_url[:80])
+            return True
+
+        # Всё ещё на login — проверяем ошибки на странице
         error = await page.query_selector(Selectors.ERROR_MESSAGE)
         if error:
             error_text = await error.inner_text()
             logger.warning("[%s] Login error: %s", human.username, error_text.strip())
             return False
 
-        # Проверяем challenge
-        challenge = await page.query_selector(Selectors.CHALLENGE_REQUIRED)
-        if challenge:
-            logger.warning("[%s] Challenge required", human.username)
-            return False
-
-        # Suspicious login attempt
-        suspicious = await page.query_selector(Selectors.SUSPICIOUS_LOGIN)
-        if suspicious:
-            logger.warning("[%s] Suspicious login attempt detected", human.username)
-            return False
-
-        # Проверяем 2FA
+        # Проверяем 2FA по селектору (fallback)
         twofa_input = await page.query_selector(Selectors.SECURITY_CODE_INPUT)
         if twofa_input:
             return await self._handle_2fa(page, human, account)
 
-        # Ждём либо навигационную панель (успех), либо ошибку
-        try:
-            await page.wait_for_selector(
-                f"{Selectors.NAV_BAR}, {Selectors.HOME_FEED}",
-                timeout=15_000,
-            )
-            return True
-        except PwTimeout:
-            # Ещё раз проверяем 2FA (может появиться с задержкой)
-            twofa_input = await page.query_selector(Selectors.SECURITY_CODE_INPUT)
-            if twofa_input:
-                return await self._handle_2fa(page, human, account)
-
-            logger.warning("[%s] No success/error/2FA detected after login", human.username)
-            return False
+        logger.warning("[%s] No result detected (URL: %s)", human.username, current_url[:100])
+        return False
 
     async def _handle_2fa(
         self,
@@ -412,47 +416,65 @@ class InstagramLogin:
             logger.error("[%s] 2FA required but no TOTP secret saved", human.username)
             return False
 
+        # Ждём загрузку 2FA страницы
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
+        await human.random_pause(2.0, 4.0)
+
         # Генерируем TOTP-код
         totp = pyotp.TOTP(totp_secret)
         code = totp.now()
-        logger.info("[%s] 2FA required, entering TOTP code", human.username)
+        logger.info("[%s] 2FA required, entering TOTP code: %s", human.username, code)
 
         # Пауза — "достаёт телефон, смотрит код"
         await human.random_pause(2.0, 5.0)
 
-        # Вводим код
-        await human.clear_and_type(Selectors.SECURITY_CODE_INPUT, code)
+        # На 2FA странице поле: input[type="text"] без name/placeholder
+        # Используем простой селектор — на этой странице только один text input
+        twofa_selector = 'input[type="text"][autocomplete="off"]'
+        try:
+            await page.wait_for_selector(twofa_selector, timeout=15_000)
+            await human.clear_and_type(twofa_selector, code)
+        except Exception as e:
+            logger.warning("[%s] 2FA input not found: %s, trying fallback", human.username, e)
+            # Fallback: первый видимый text input
+            try:
+                await human.clear_and_type('input[type="text"]', code)
+            except Exception as e2:
+                logger.error("[%s] 2FA input fallback failed: %s", human.username, e2)
+                return False
+
         await human.random_pause(0.5, 1.2)
 
-        # Нажимаем Confirm
-        try:
-            confirm_btn = await page.wait_for_selector(
-                Selectors.CONFIRM_2FA_BUTTON,
-                timeout=5000,
-            )
-            if confirm_btn:
-                await human.click_element(confirm_btn)
-        except PwTimeout:
-            # Fallback: Enter
-            await page.keyboard.press("Enter")
+        # Нажимаем Enter (кнопка Continue тоже скрытая, как и Log In)
+        await page.keyboard.press("Enter")
+        logger.info("[%s] Pressed Enter to confirm 2FA", human.username)
 
-        await human.random_pause(3.0, 5.0)
+        await human.random_pause(3.0, 6.0)
 
-        # Проверяем результат
+        # Ждём redirect после 2FA
+        for _ in range(20):
+            await asyncio.sleep(1)
+            current_url = page.url
+            # Успех — ушли со страницы 2FA
+            if "two_step" not in current_url and "two_factor" not in current_url and "challenge" not in current_url:
+                logger.info("[%s] 2FA passed, URL: %s", human.username, current_url[:80])
+                return True
+            # Challenge после 2FA
+            if "challenge" in current_url:
+                logger.warning("[%s] Challenge after 2FA", human.username)
+                return False
+
+        # Проверяем ошибки на странице
         error = await page.query_selector(Selectors.ERROR_MESSAGE)
         if error:
             logger.warning("[%s] 2FA code rejected", human.username)
             return False
 
-        try:
-            await page.wait_for_selector(
-                f"{Selectors.NAV_BAR}, {Selectors.HOME_FEED}",
-                timeout=15_000,
-            )
-            return True
-        except PwTimeout:
-            logger.warning("[%s] No feed after 2FA", human.username)
-            return False
+        logger.warning("[%s] Still on 2FA page after 20s", human.username)
+        return False
 
     # ── Попапы после логина ───────────────────────────────────────────────
 
@@ -685,12 +707,33 @@ class LoginOrchestrator:
                 logger.warning("[%s] Challenge → cooldown", account["username"])
                 return result
 
-            # Удаляем прокси — он "сгорел" на этом аккаунте
-            await self._delete_proxy(proxy_id)
-            logger.info(
-                "[%s] Proxy %s deleted after failed login",
-                account["username"], proxy_for_launch["server"],
-            )
+            # Удаляем прокси ТОЛЬКО если Instagram реально ответил (неверный пароль).
+            # НЕ удаляем при внутренних ошибках (crash, timeout, наш баг).
+            proxy_kill_reasons = [
+                "incorrect password", "wrong password", "invalid credentials",
+                "the password you entered is incorrect",
+                "doesn't belong to an account", "user not found",
+            ]
+            is_proxy_fault = any(r in result.message.lower() for r in proxy_kill_reasons)
+
+            if is_proxy_fault:
+                await self._delete_proxy(proxy_id)
+                logger.info(
+                    "[%s] Proxy %s DELETED — Instagram rejected: %s",
+                    account["username"], proxy_for_launch["server"], result.message,
+                )
+            else:
+                # Внутренняя ошибка — возвращаем прокси в пул
+                from backend.database import execute, run_sync
+                await run_sync(
+                    execute,
+                    "UPDATE static_proxies SET status = 'available', account_id = NULL WHERE id = ?",
+                    (proxy_id,),
+                )
+                logger.warning(
+                    "[%s] Login failed, proxy %s returned to pool (internal error): %s",
+                    account["username"], proxy_for_launch["server"], result.message,
+                )
 
             # Закрываем профиль перед следующей попыткой
             await self.pm.close_profile(account["username"])

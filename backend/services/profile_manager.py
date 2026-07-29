@@ -32,6 +32,28 @@ from backend.config import PROFILES_DIR as _CONFIG_PROFILES_DIR
 
 logger = logging.getLogger("instagrid.profile_manager")
 
+
+# ─── Утилита: dict → объект с атрибутами ─────────────────────────────────────
+
+class _Namespace:
+    """dict с доступом через точку: ns.navigator.userAgent"""
+    def __init__(self, d: dict):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                setattr(self, k, _Namespace(v))
+            elif isinstance(v, list):
+                setattr(self, k, [_Namespace(i) if isinstance(i, dict) else i for i in v])
+            else:
+                setattr(self, k, v)
+
+    def __repr__(self):
+        return f"_Namespace({self.__dict__})"
+
+
+def _dict_to_namespace(d: dict) -> _Namespace:
+    """Конвертирует dict в объект с атрибутами для Camoufox."""
+    return _Namespace(d)
+
 # ─── Константы ────────────────────────────────────────────────────────────────
 
 PROFILES_DIR = _CONFIG_PROFILES_DIR
@@ -65,22 +87,21 @@ class ScreenGeometry:
 # Пресеты привязаны к ОС (из browser_launcher.py)
 GEOMETRY_PRESETS: dict[OsPlatform, list[ScreenGeometry]] = {
     OsPlatform.WINDOWS: [
-        ScreenGeometry(1680, 1050, "windows_large_1680x1050"),
-        ScreenGeometry(1536, 864, "windows_medium_1536x864"),
-        ScreenGeometry(1440, 900, "windows_medium_1440x900"),
+        ScreenGeometry(1280, 720, "windows_hd_1280x720"),
         ScreenGeometry(1366, 768, "windows_small_1366x768"),
-        ScreenGeometry(1920, 1080, "windows_fhd_1920x1080"),
+        ScreenGeometry(1280, 800, "windows_medium_1280x800"),
+        ScreenGeometry(1360, 768, "windows_medium_1360x768"),
+        ScreenGeometry(1440, 810, "windows_medium_1440x810"),
     ],
     OsPlatform.MACOS: [
-        ScreenGeometry(1440, 900, "macos_default_1440x900"),
-        ScreenGeometry(1680, 1050, "macos_large_1680x1050"),
-        ScreenGeometry(1280, 800, "macos_small_1280x800"),
-        ScreenGeometry(1920, 1080, "macos_fhd_1920x1080"),
+        ScreenGeometry(1280, 800, "macos_default_1280x800"),
+        ScreenGeometry(1366, 768, "macos_small_1366x768"),
+        ScreenGeometry(1440, 810, "macos_medium_1440x810"),
     ],
     OsPlatform.LINUX: [
-        ScreenGeometry(1920, 1080, "linux_fhd_1920x1080"),
         ScreenGeometry(1366, 768, "linux_small_1366x768"),
-        ScreenGeometry(1440, 900, "linux_medium_1440x900"),
+        ScreenGeometry(1280, 720, "linux_hd_1280x720"),
+        ScreenGeometry(1440, 810, "linux_medium_1440x810"),
     ],
 }
 
@@ -146,16 +167,19 @@ def generate_fingerprint(
     fg = FingerprintGenerator(
         browser="firefox",
         os=os_platform.value,
-        screen=Screen(
-            min_width=screen_geometry.width,
-            max_width=screen_geometry.width,
-            min_height=screen_geometry.height,
-            max_height=screen_geometry.height,
-        ),
     )
 
     fingerprint = fg.generate()
-    return fingerprint
+
+    # BrowserForge возвращает Fingerprint-объект, конвертируем в dict для JSON
+    def _to_dict(obj):
+        if hasattr(obj, '__dict__'):
+            return {k: _to_dict(v) for k, v in obj.__dict__.items() if not k.startswith('_')}
+        elif isinstance(obj, list):
+            return [_to_dict(i) for i in obj]
+        return obj
+
+    return _to_dict(fingerprint)
 
 
 # ─── Модель профиля ──────────────────────────────────────────────────────────
@@ -291,9 +315,10 @@ class ProfileManager:
         if not profile_dir.exists():
             raise FileNotFoundError(f"Profile {profile_id} not found")
 
-        # Загружаем fingerprint
+        # Загружаем fingerprint и конвертируем dict → объект с атрибутами (Camoufox требует .navigator и т.д.)
         fp_path = profile_dir / FINGERPRINT_FILE
-        fingerprint = json.loads(fp_path.read_text(encoding="utf-8"))
+        fp_dict = json.loads(fp_path.read_text(encoding="utf-8"))
+        fingerprint = _dict_to_namespace(fp_dict)
 
         # Загружаем мету для geometry
         meta_path = profile_dir / META_FILE
@@ -310,8 +335,11 @@ class ProfileManager:
         # Формируем Camoufox proxy config
         camoufox_proxy = None
         if proxy:
+            server = proxy["server"]
+            if not server.startswith("http"):
+                server = f"http://{server}"
             camoufox_proxy = {
-                "server": proxy["server"],
+                "server": server,
                 "username": proxy.get("username", ""),
                 "password": proxy.get("password", ""),
             }
@@ -368,6 +396,7 @@ class ProfileManager:
         headless: bool,
     ) -> BrowserContext:
         """Внутренний запуск Camoufox с persistent_context."""
+        from playwright.async_api import async_playwright
 
         # user_data_dir — куки/кеш сохраняются между сессиями
         user_data_dir = str(profile_dir / "browser_data")
@@ -376,7 +405,9 @@ class ProfileManager:
             "headless": headless,
             "persistent_context": True,
             "user_data_dir": user_data_dir,
-            "fingerprint": fingerprint,
+            # Camoufox сам генерирует fingerprint через BrowserForge
+            # Передаём только os для правильной генерации
+            "os": "windows",
             # WebRTC всегда заблокирован
             "block_webrtc": True,
             # Язык всегда en-US
@@ -393,8 +424,10 @@ class ProfileManager:
         if proxy:
             launch_kwargs["proxy"] = proxy
 
-        # Camoufox AsyncNewBrowser возвращает BrowserContext
-        context = await AsyncNewBrowser(**launch_kwargs)
+        # Camoufox AsyncNewBrowser требует playwright instance
+        pw = await async_playwright().start()
+        self._playwright = pw  # сохраняем чтобы закрыть потом
+        context = await AsyncNewBrowser(pw, **launch_kwargs)
 
         return context
 
