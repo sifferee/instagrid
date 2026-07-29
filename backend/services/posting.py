@@ -46,6 +46,37 @@ from backend.services.dialog_gate import (
 logger = logging.getLogger("instagrid.posting")
 
 
+# ─── Попапы, блокирующие взаимодействие со страницей ────────────────────────
+
+async def _clear_blocking_dialogs(page, username: str, wait_seconds: float = 6.0) -> None:
+    """
+    Закрывает известные блокирующие попапы (cookie consent, save login info,
+    turn on notifications) перед тем как бот начнёт кликать по странице.
+
+    Раньше dialog_gate вызывался только один раз — после Share, чтобы
+    подтвердить успешную публикацию. Между заходом на страницу и этим
+    моментом попапы никак не обрабатывались, поэтому бот просто "вставал"
+    в них: клики по ленте/кнопке "+" утыкались в оверлей попапа, а не
+    в реальный элемент под ним.
+
+    policy_notice/checkpoint/restriction/suspended сюда не входят —
+    это не мусорные попапы, а важные сигналы (например, снесли пост),
+    их лучше показать оператору в логе, а не тихо закрыть.
+    """
+    try:
+        result = await continue_after_dialog(page, allow_safe_close=False, wait_seconds=wait_seconds)
+        outcome = result.get("outcome", "")
+        if outcome == HANDLED_REEVALUATE:
+            logger.info("[%s] Dismissed blocking dialog before proceeding", username)
+        elif outcome == TERMINAL_MANUAL:
+            logger.warning(
+                "[%s] Blocking dialog present, not auto-dismissed (state=%s) — needs manual look",
+                username, result.get("state"),
+            )
+    except Exception as e:
+        logger.debug("[%s] Dialog gate check failed: %s", username, e)
+
+
 # ─── Константы ────────────────────────────────────────────────────────────────
 
 INSTAGRAM_URL = "https://www.instagram.com/"
@@ -181,6 +212,10 @@ class FeedWarmer:
 
         await self.human.random_pause(1.0, 3.0)
 
+        # Закрываем известные попапы (cookie consent, save login, notifications)
+        # прежде чем начать листать ленту — иначе клики будут утыкаться в оверлей
+        await _clear_blocking_dialogs(self.page, self.human.username)
+
         while time.time() < end_time:
             action = random.choices(
                 ["scroll", "like", "dwell", "wander", "reels", "comments"],
@@ -274,6 +309,9 @@ class ReelPoster:
         logger.info("[%s] Posting reel: %s", username, video_path)
 
         try:
+            # На случай если новый попап вылез уже после прогрева (между сессиями/рилсами)
+            await _clear_blocking_dialogs(self.page, username)
+
             # 1. Нажимаем «Создать»
             await self.human.click_selector(PostSelectors.CREATE_BUTTON)
             await self.human.random_pause(1.0, 2.0)
