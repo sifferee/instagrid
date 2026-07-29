@@ -25,7 +25,7 @@ _login_state = {
 
 class LoginRequest(BaseModel):
     account_ids: list[int]
-    pool_id: int
+    pool_id: int | None = None  # если не указан — берётся из ниши аккаунта
 
 
 @router.get("/status")
@@ -40,11 +40,42 @@ async def start_login(body: LoginRequest):
     if _login_state["running"]:
         raise HTTPException(409, "Логин уже запущен")
 
+    # Определяем pool_id: из запроса или из ниши аккаунтов
+    pool_id = body.pool_id
+
+    if not pool_id:
+        # Пробуем взять пул из ниши первого аккаунта
+        for aid in body.account_ids:
+            acc = await run_sync(
+                query_one,
+                """SELECT a.niche_id, n.proxy_pool_id
+                   FROM accounts a
+                   LEFT JOIN niches n ON n.id = a.niche_id
+                   WHERE a.id = ?""",
+                (aid,),
+            )
+            if acc and acc.get("proxy_pool_id"):
+                pool_id = acc["proxy_pool_id"]
+                break
+
+    if not pool_id:
+        # Fallback: первый статический пул
+        first_pool = await run_sync(
+            query_one,
+            "SELECT id FROM proxy_pools WHERE pool_type = 'static' ORDER BY id ASC LIMIT 1",
+            (),
+        )
+        if first_pool:
+            pool_id = first_pool["id"]
+
+    if not pool_id:
+        raise HTTPException(400, "Нет пулов прокси. Создай на странице Прокси.")
+
     # Проверяем что пул существует
     pool = await run_sync(
         query_one,
-        "SELECT id FROM proxy_pools WHERE id = ? AND pool_type = 'static'",
-        (body.pool_id,),
+        "SELECT id FROM proxy_pools WHERE id = ?",
+        (pool_id,),
     )
     if not pool:
         raise HTTPException(404, "Пул прокси не найден")
@@ -98,7 +129,7 @@ async def start_login(body: LoginRequest):
         "results": already_results,
     })
 
-    asyncio.create_task(_run_login(to_login, body.pool_id))
+    asyncio.create_task(_run_login(to_login, pool_id))
     return {"started": True, "accounts": len(to_login), "skipped": len(already_ok)}
 
 

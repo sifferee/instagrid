@@ -79,29 +79,84 @@ class OsPlatform(Enum):
 
 @dataclass(frozen=True)
 class ScreenGeometry:
-    width: int
-    height: int
+    """Полная геометрия окна: screen ≠ outer ≠ viewport (из SparkGrid)."""
+    # Экран монитора
+    screen_width: int
+    screen_height: int
+    avail_width: int       # screen - taskbar
+    avail_height: int
+    # Окно браузера (рамки + тулбар)
+    outer_width: int
+    outer_height: int
+    # Видимая область контента
+    viewport_width: int
+    viewport_height: int
+    # Позиция окна на экране
+    position_x: int
+    position_y: int
     label: str
 
+    # Backward compat
+    @property
+    def width(self) -> int:
+        return self.viewport_width
 
-# Пресеты привязаны к ОС (из browser_launcher.py)
+    @property
+    def height(self) -> int:
+        return self.viewport_height
+
+
+def _windows_geometry(screen_w: int, screen_h: int, label: str) -> ScreenGeometry:
+    """Генерирует реалистичную Windows геометрию из размера экрана (порт SparkGrid)."""
+    avail_w = screen_w
+    avail_h = max(700, screen_h - 40)  # taskbar ~40px
+    outer_w = max(1180, min(avail_w - 56, round(avail_w * 0.967)))
+    outer_h = max(780, min(avail_h - 24, round(avail_h * 0.965)))
+    viewport_w = outer_w - 16    # window chrome
+    viewport_h = outer_h - 88   # toolbar + tabs
+    pos_x = max(12, (screen_w - outer_w) // 2)
+    pos_y = 18
+    return ScreenGeometry(
+        screen_width=screen_w, screen_height=screen_h,
+        avail_width=avail_w, avail_height=avail_h,
+        outer_width=outer_w, outer_height=outer_h,
+        viewport_width=viewport_w, viewport_height=viewport_h,
+        position_x=pos_x, position_y=pos_y,
+        label=label,
+    )
+
+
+# Пресеты привязаны к ОС (из SparkGrid browser_launcher.py)
 GEOMETRY_PRESETS: dict[OsPlatform, list[ScreenGeometry]] = {
     OsPlatform.WINDOWS: [
-        ScreenGeometry(1280, 720, "windows_hd_1280x720"),
-        ScreenGeometry(1366, 768, "windows_small_1366x768"),
-        ScreenGeometry(1280, 800, "windows_medium_1280x800"),
-        ScreenGeometry(1360, 768, "windows_medium_1360x768"),
-        ScreenGeometry(1440, 810, "windows_medium_1440x810"),
+        _windows_geometry(1366, 768, "windows_1366x768"),
+        _windows_geometry(1440, 900, "windows_1440x900"),
+        _windows_geometry(1536, 864, "windows_1536x864"),
+        _windows_geometry(1600, 900, "windows_1600x900"),
+        _windows_geometry(1680, 1050, "windows_1680x1050"),
+        _windows_geometry(1920, 1080, "windows_1920x1080"),
     ],
     OsPlatform.MACOS: [
-        ScreenGeometry(1280, 800, "macos_default_1280x800"),
-        ScreenGeometry(1366, 768, "macos_small_1366x768"),
-        ScreenGeometry(1440, 810, "macos_medium_1440x810"),
+        ScreenGeometry(
+            screen_width=1512, screen_height=982,
+            avail_width=1512, avail_height=944,
+            outer_width=1424, outer_height=896,
+            viewport_width=1408, viewport_height=804,
+            position_x=44, position_y=28,
+            label="macos_retina_1512x982",
+        ),
+        ScreenGeometry(
+            screen_width=1440, screen_height=900,
+            avail_width=1440, avail_height=860,
+            outer_width=1360, outer_height=824,
+            viewport_width=1344, viewport_height=736,
+            position_x=40, position_y=18,
+            label="macos_1440x900",
+        ),
     ],
     OsPlatform.LINUX: [
-        ScreenGeometry(1366, 768, "linux_small_1366x768"),
-        ScreenGeometry(1280, 720, "linux_hd_1280x720"),
-        ScreenGeometry(1440, 810, "linux_medium_1440x810"),
+        _windows_geometry(1366, 768, "linux_1366x768"),
+        _windows_geometry(1920, 1080, "linux_1920x1080"),
     ],
 }
 
@@ -199,9 +254,21 @@ class ProfileInfo:
             "profile_id": self.profile_id,
             "profile_dir": str(self.profile_dir),
             "os_platform": self.os_platform.value,
-            "screen_width": self.screen_geometry.width,
-            "screen_height": self.screen_geometry.height,
+            "screen_width": self.screen_geometry.viewport_width,
+            "screen_height": self.screen_geometry.viewport_height,
             "screen_label": self.screen_geometry.label,
+            "screen_geometry": {
+                "screen_width": self.screen_geometry.screen_width,
+                "screen_height": self.screen_geometry.screen_height,
+                "avail_width": self.screen_geometry.avail_width,
+                "avail_height": self.screen_geometry.avail_height,
+                "outer_width": self.screen_geometry.outer_width,
+                "outer_height": self.screen_geometry.outer_height,
+                "viewport_width": self.screen_geometry.viewport_width,
+                "viewport_height": self.screen_geometry.viewport_height,
+                "position_x": self.screen_geometry.position_x,
+                "position_y": self.screen_geometry.position_y,
+            },
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
         }
@@ -209,7 +276,26 @@ class ProfileInfo:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ProfileInfo:
         os_plat = OsPlatform(d["os_platform"])
-        geom = ScreenGeometry(d["screen_width"], d["screen_height"], d["screen_label"])
+        sg = d.get("screen_geometry")
+        if sg and isinstance(sg, dict):
+            geom = ScreenGeometry(
+                screen_width=sg.get("screen_width", d.get("screen_width", 1366)),
+                screen_height=sg.get("screen_height", d.get("screen_height", 768)),
+                avail_width=sg.get("avail_width", sg.get("screen_width", 1366)),
+                avail_height=sg.get("avail_height", sg.get("screen_height", 728)),
+                outer_width=sg.get("outer_width", d.get("screen_width", 1366) - 16),
+                outer_height=sg.get("outer_height", d.get("screen_height", 768) - 88),
+                viewport_width=sg.get("viewport_width", d.get("screen_width", 1350)),
+                viewport_height=sg.get("viewport_height", d.get("screen_height", 680)),
+                position_x=sg.get("position_x", 28),
+                position_y=sg.get("position_y", 18),
+                label=d.get("screen_label", "migrated"),
+            )
+        else:
+            # Backward compat: old format with just screen_width/screen_height
+            w = d.get("screen_width", 1366)
+            h = d.get("screen_height", 768)
+            geom = _windows_geometry(w, h, d.get("screen_label", f"migrated_{w}x{h}"))
         return cls(
             profile_id=d["profile_id"],
             profile_dir=Path(d["profile_dir"]),
@@ -323,13 +409,17 @@ class ProfileManager:
         # Загружаем мету для geometry
         meta_path = profile_dir / META_FILE
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        screen_w = meta["screen_width"]
-        screen_h = meta["screen_height"]
+        info = ProfileInfo.from_dict(meta)
+        geom = info.screen_geometry
+        screen_w = geom.viewport_width
+        screen_h = geom.viewport_height
 
         # GeoIP timezone по прокси
         timezone_id = "America/New_York"
         if proxy:
-            proxy_host = proxy["server"].split(":")[0]
+            server_str = proxy["server"]
+            # Убираем схему для GeoIP lookup
+            proxy_host = server_str.split("://")[-1].split(":")[0].split("@")[-1]
             timezone_id = self.geoip.get_timezone(proxy_host)
 
         # Формируем Camoufox proxy config (поддержка HTTP/HTTPS/SOCKS5)
@@ -359,6 +449,29 @@ class ProfileManager:
                     headless=headless,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
+
+                # Инжектим реалистичные outer/screen метрики (SparkGrid паттерн)
+                # viewport задаётся через Camoufox, но outerWidth/outerHeight/screenX/screenY
+                # и screen.width/height нужно выставить вручную через JS
+                geometry_js = f"""() => {{
+                    Object.defineProperty(window, 'outerWidth', {{value: {geom.outer_width}, configurable: true}});
+                    Object.defineProperty(window, 'outerHeight', {{value: {geom.outer_height}, configurable: true}});
+                    Object.defineProperty(window, 'screenX', {{value: {geom.position_x}, configurable: true}});
+                    Object.defineProperty(window, 'screenY', {{value: {geom.position_y}, configurable: true}});
+                    Object.defineProperty(window, 'screenLeft', {{value: {geom.position_x}, configurable: true}});
+                    Object.defineProperty(window, 'screenTop', {{value: {geom.position_y}, configurable: true}});
+                    if (window.screen) {{
+                        Object.defineProperty(screen, 'width', {{value: {geom.screen_width}, configurable: true}});
+                        Object.defineProperty(screen, 'height', {{value: {geom.screen_height}, configurable: true}});
+                        Object.defineProperty(screen, 'availWidth', {{value: {geom.avail_width}, configurable: true}});
+                        Object.defineProperty(screen, 'availHeight', {{value: {geom.avail_height}, configurable: true}});
+                    }}
+                }}"""
+                try:
+                    await context.add_init_script(script=geometry_js)
+                    await page.evaluate(geometry_js)
+                except Exception as ge:
+                    logger.debug("Geometry injection note: %s", ge)
 
                 self._active_contexts[profile_id] = context
 

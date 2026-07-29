@@ -30,10 +30,11 @@ PRAGMA busy_timeout = 5000;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS niches (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL UNIQUE,
-    created_at  REAL    NOT NULL DEFAULT (unixepoch('now')),
-    updated_at  REAL    NOT NULL DEFAULT (unixepoch('now'))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT    NOT NULL UNIQUE,
+    proxy_pool_id   INTEGER REFERENCES proxy_pools(id) ON DELETE SET NULL,
+    created_at      REAL    NOT NULL DEFAULT (unixepoch('now')),
+    updated_at      REAL    NOT NULL DEFAULT (unixepoch('now'))
 );
 
 CREATE TABLE IF NOT EXISTS proxy_pools (
@@ -138,6 +139,14 @@ def init_db():
         cols = {row[1] for row in conn.execute("PRAGMA table_info(static_proxies)")}
         if "protocol" not in cols:
             conn.execute("ALTER TABLE static_proxies ADD COLUMN protocol TEXT NOT NULL DEFAULT 'http'")
+            conn.commit()
+    except Exception:
+        pass
+    # Миграция: добавить proxy_pool_id в niches
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(niches)")}
+        if "proxy_pool_id" not in cols:
+            conn.execute("ALTER TABLE niches ADD COLUMN proxy_pool_id INTEGER REFERENCES proxy_pools(id) ON DELETE SET NULL")
             conn.commit()
     except Exception:
         pass
