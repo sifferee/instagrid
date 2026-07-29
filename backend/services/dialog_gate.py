@@ -284,7 +284,7 @@ async def capture_error_report(
     except Exception as e:
         logger.debug("[%s] HTML capture failed: %s", username, e)
 
-    # Видимый текст + кнопки + заголовок + текущий URL
+    # Видимый текст + кнопки + заголовок + текущий URL + состояние полей формы
     info: dict[str, Any] = {}
     try:
         info = await page.evaluate("""() => {
@@ -296,12 +296,18 @@ async def capture_error_report(
             const clean = (t) => String(t || '').replace(/\\s+/g, ' ').trim();
             const buttons = [...document.querySelectorAll('button,[role="button"],a')]
                 .filter(vis).map(e => clean(e.getAttribute('aria-label') || e.innerText)).filter(t => t.length > 0);
+            const inputs = [...document.querySelectorAll('input,textarea')].map(i => ({
+                name: i.name || i.type || i.tagName.toLowerCase(),
+                filled: !!i.value,
+                len: (i.value || '').length,
+            }));
             return {
                 title: clean(document.title),
                 url: location.href,
                 lang: document.documentElement.lang || '',
                 bodyText: clean(document.body ? document.body.innerText : '').slice(0, 2000),
                 buttons: [...new Set(buttons)].slice(0, 25),
+                inputs,
             };
         }""")
     except Exception as e:
@@ -323,6 +329,12 @@ async def capture_error_report(
             lines.append("## Дополнительные данные")
             for k, v in extra.items():
                 lines.append(f"- **{k}:** {v}")
+            lines.append("")
+        if info.get("inputs"):
+            # Только имя поля + заполнено ли + длина — сами значения (пароли и т.п.) никогда не пишем
+            lines.append("## Поля формы (без самих значений)")
+            for i in info.get("inputs", []):
+                lines.append(f"- {i.get('name')}: filled={i.get('filled')} len={i.get('len')}")
             lines.append("")
         lines.append("## Видимые кнопки на странице")
         for b in info.get("buttons", []):

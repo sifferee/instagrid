@@ -237,8 +237,19 @@ class InstagramLogin:
                 login_ok = await self._wait_for_login_result(page, human, account)
 
                 if not login_ok:
-                    result.status = AccountStatus.DEAD
-                    result.message = "Login failed — invalid credentials or challenge"
+                    current_url = str(getattr(page, "url", "") or "")
+                    if "challenge" in current_url or "suspicious" in current_url.lower():
+                        # Настоящий challenge/suspicious по адресу страницы —
+                        # не наша вина, не аккаунт виноват, прокси не жжём.
+                        result.status = AccountStatus.COOLDOWN
+                        result.message = f"Account blocked (challenge): {current_url}"
+                    else:
+                        # Обычный отказ (неверный пароль и т.п.) — раньше здесь
+                        # текст всегда содержал слово "challenge" как часть общей
+                        # фразы, из-за чего ЛЮБОЙ неверный пароль ошибочно ловился
+                        # проверкой "это временная блокировка" в login_with_rotation.
+                        result.status = AccountStatus.DEAD
+                        result.message = "Login failed — invalid credentials"
                     result.attempts = 1
                     return result
 
@@ -462,7 +473,10 @@ class InstagramLogin:
         if error:
             error_text = await error.inner_text()
             logger.warning("[%s] Login error: %s", human.username, error_text.strip())
-            await self._diagnose_page(page, human, "login_error")
+            await capture_error_report(
+                page, human.username, "login_error",
+                extra={"error_text": error_text.strip(), "url": current_url},
+            )
             return False
 
         # Проверяем 2FA по селектору (fallback)
@@ -471,74 +485,8 @@ class InstagramLogin:
             return await self._handle_2fa(page, human, account)
 
         logger.warning("[%s] No result detected (URL: %s)", human.username, current_url[:100])
-        await self._diagnose_page(page, human, "no_result")
+        await capture_error_report(page, human.username, "no_result", extra={"url": current_url})
         return False
-
-    async def _diagnose_page(self, page: Page, human: HumanInteractor, tag: str) -> None:
-        """
-        Снимает состояние страницы, когда результат непонятен.
-
-        Без этого отладка идёт вслепую: в логе «No result detected», а что
-        именно показал Instagram — неизвестно. Сохраняет скриншот и вытаскивает
-        текст возможных ошибок. Ищем по роли и положению в форме, а не по
-        английским словам — страница может быть на любом языке.
-        """
-        from pathlib import Path as _P
-        import time as _t
-
-        try:
-            shots = _P("logs") / "screenshots"
-            shots.mkdir(parents=True, exist_ok=True)
-            stamp = _t.strftime("%Y%m%d_%H%M%S")
-            shot = shots / f"{stamp}_{human.username}_{tag}.png"
-            await page.screenshot(path=str(shot), full_page=False)
-            logger.warning("[%s] Screenshot: %s", human.username, shot)
-        except Exception as e:
-            logger.debug("[%s] Screenshot failed: %s", human.username, e)
-
-        try:
-            info = await page.evaluate("""() => {
-                const vis = (el) => {
-                    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
-                    return r.width > 4 && r.height > 4 && s.display !== 'none' &&
-                           s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.05;
-                };
-                const clean = (t) => String(t || '').replace(/\\s+/g, ' ').trim();
-                const alerts = [...document.querySelectorAll(
-                    '[role="alert"],[aria-live],#slfErrorAlert,' +
-                    '[data-testid*="error"],[id*="error" i],[class*="error" i]'
-                )].filter(vis).map(e => clean(e.innerText)).filter(t => t.length > 2);
-                const form = document.querySelector('form');
-                const formText = form ? clean(form.innerText).slice(0, 400) : '';
-                const inputs = [...document.querySelectorAll('input')].map(i => ({
-                    name: i.name || i.type,
-                    filled: !!i.value,
-                    len: (i.value || '').length,
-                }));
-                return {
-                    alerts: [...new Set(alerts)].slice(0, 5),
-                    formText, inputs,
-                    title: clean(document.title),
-                    lang: document.documentElement.lang || '',
-                    bodyStart: clean(document.body ? document.body.innerText : '').slice(0, 300),
-                };
-            }""")
-
-            logger.warning("[%s] -- ДИАГНОСТИКА СТРАНИЦЫ --", human.username)
-            logger.warning("[%s]   title : %s", human.username, str(info.get("title", ""))[:90])
-            logger.warning("[%s]   lang  : %s", human.username, info.get("lang", ""))
-            for a in info.get("alerts", []):
-                logger.warning("[%s]   ALERT : %s", human.username, str(a)[:180])
-            for i in info.get("inputs", []):
-                logger.warning(
-                    "[%s]   input : %s filled=%s len=%s",
-                    human.username, i.get("name"), i.get("filled"), i.get("len"),
-                )
-            if info.get("formText"):
-                logger.warning("[%s]   form  : %s", human.username, str(info["formText"])[:250])
-            logger.warning("[%s]   body  : %s", human.username, str(info.get("bodyStart", ""))[:250])
-        except Exception as e:
-            logger.debug("[%s] Page diagnostics failed: %s", human.username, e)
 
     async def _handle_2fa(
         self,
