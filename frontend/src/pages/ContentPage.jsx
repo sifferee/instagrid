@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../api/client'
 
+const MSG_TIMEOUT_MS = 4000
+
 const s = {
   card: { background: '#161b22', border: '1px solid #30363d', borderRadius: 8, padding: 16, marginBottom: 16 },
   btn: { padding: '8px 16px', borderRadius: 6, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
@@ -26,8 +28,21 @@ export default function ContentPage() {
   const [genRef, setGenRef] = useState('')
   const [genCount, setGenCount] = useState(50)
   const [genKey, setGenKey] = useState('')
-  const [msg, setMsg] = useState('')
+  const [msg, setMsgRaw] = useState('')
   const fileRef = useRef()
+  const msgTimer = useRef(null)
+
+  // Баннер-сообщение всегда живёт максимум MSG_TIMEOUT_MS, потом само пропадает.
+  // Раньше сообщение зависало навсегда и могло показывать результат позапрошлого
+  // действия, никак не связанный с текущим реальным состоянием (видно по stats ниже).
+  const setMsg = (text) => {
+    if (msgTimer.current) clearTimeout(msgTimer.current)
+    setMsgRaw(text)
+    if (text) {
+      msgTimer.current = setTimeout(() => setMsgRaw(''), MSG_TIMEOUT_MS)
+    }
+  }
+  useEffect(() => () => { if (msgTimer.current) clearTimeout(msgTimer.current) }, [])
 
   const load = async () => {
     try {
@@ -54,7 +69,7 @@ export default function ContentPage() {
     setMsg('Распределяю...')
     try {
       const r = await api.distributeAll()
-      setMsg(`Видео: ${r.videos.assigned} назначено. Описания: ${r.descriptions.assigned} назначено.`)
+      setMsg(`Видео: ${r.videos.assigned} назначено сейчас. Описания: ${r.descriptions.assigned} назначено сейчас.`)
       load()
     } catch (e) { setMsg('Ошибка: ' + e.message) }
   }

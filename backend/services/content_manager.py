@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import secrets
 import shutil
 import zipfile
 from pathlib import Path
@@ -92,6 +93,17 @@ def _file_hash(filepath: Path) -> str:
     return h.hexdigest()
 
 
+def _random_filename(ext: str) -> str:
+    """
+    Случайное 12-символьное имя файла, сохраняет расширение.
+
+    Оригинальное имя видео (особенно если оно скачано с Instagram) часто
+    содержит ID исходного поста прямо в имени файла — это не нужно оставлять
+    ни в файловой системе, ни в БД. Имя генерируется заново при каждой загрузке.
+    """
+    return secrets.token_hex(6) + ext  # 6 байт = 12 hex-символов
+
+
 # ─── Управление видео ────────────────────────────────────────────────────────
 
 class VideoManager:
@@ -142,23 +154,23 @@ class VideoManager:
                     skipped += 1
                     continue
 
-                # Извлекаем
-                filename = Path(member).name
-                dest = niche_dir / filename
-
-                # Если файл с таким именем уже есть — добавляем суффикс
-                counter = 1
-                while dest.exists():
-                    stem = Path(member).stem
-                    dest = niche_dir / f"{stem}_{counter}{ext}"
-                    counter += 1
-
+                # Извлекаем во вложенную структуру ZIP как есть...
+                original_name = Path(member).name
                 zf.extract(member, niche_dir)
                 extracted = niche_dir / member
 
-                # Перемещаем из вложенных папок в корень niche_dir
+                # ...затем переименовываем в случайное 12-символьное имя.
+                # Не оставляем оригинальное имя файла ни на диске, ни в БД.
+                new_name = _random_filename(ext)
+                dest = niche_dir / new_name
+                while dest.exists():
+                    new_name = _random_filename(ext)
+                    dest = niche_dir / new_name
+
                 if extracted != dest:
                     shutil.move(str(extracted), str(dest))
+
+                logger.info("Video renamed on import: %s -> %s", original_name, new_name)
 
                 # Хеш для дедупликации
                 fhash = _file_hash(dest)
@@ -214,10 +226,15 @@ class VideoManager:
         if existing:
             return None
 
-        # Копируем в content dir
+        # Копируем в content dir под случайным 12-символьным именем
         niche_dir = self.base_dir / (str(niche_id) if niche_id else "general")
         niche_dir.mkdir(parents=True, exist_ok=True)
-        dest = niche_dir / file_path.name
+        ext = file_path.suffix.lower()
+        new_name = _random_filename(ext)
+        dest = niche_dir / new_name
+        while dest.exists():
+            new_name = _random_filename(ext)
+            dest = niche_dir / new_name
         shutil.copy2(file_path, dest)
 
         video_id = await _run_sync(

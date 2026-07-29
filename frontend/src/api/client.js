@@ -96,6 +96,7 @@ export const api = {
     return request('/content/descriptions' + (q.toString() ? '?' + q : ''))
   },
   distributeDescriptions: (niche_id) => request('/content/descriptions/distribute' + (niche_id ? '?niche_id=' + niche_id : ''), { method: 'POST' }),
+  assignDescription: (description_id, account_id) => request('/content/descriptions/assign', { method: 'POST', body: JSON.stringify({ description_id, account_id }) }),
   updateDescription: (id, text) => request(`/content/descriptions/${id}`, { method: 'PUT', body: JSON.stringify({ text }) }),
   deleteDescription: (id) => request(`/content/descriptions/${id}`, { method: 'DELETE' }),
   distributeAll: (niche_id) => request('/content/distribute-all' + (niche_id ? '?niche_id=' + niche_id : ''), { method: 'POST' }),

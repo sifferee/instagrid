@@ -35,6 +35,10 @@ export default function AccountsPage() {
   const [loginPoolId, setLoginPoolId] = useState('')
   const [loginState, setLoginState] = useState(null)
   const [loginRunning, setLoginRunning] = useState(false)
+  const [videos, setVideos] = useState([])
+  const [descriptions, setDescriptions] = useState([])
+  const [editingVideoFor, setEditingVideoFor] = useState(null)
+  const [editingDescFor, setEditingDescFor] = useState(null)
 
   const load = () => {
     const params = {}
@@ -43,11 +47,47 @@ export default function AccountsPage() {
     api.getAccounts(params).then(setAccounts).catch(e => setError(e.message))
   }
 
+  const loadContent = () => {
+    api.getVideos().then(setVideos).catch(() => {})
+    api.getDescriptions().then(setDescriptions).catch(() => {})
+  }
+
   useEffect(() => {
     api.getNiches().then(setNiches)
     fetch('/api/proxies/pools').then(r => r.json()).then(setPools).catch(() => {})
+    loadContent()
   }, [])
   useEffect(() => { load() }, [filterNiche, filterStatus])
+
+  // Быстрый доступ: какое видео/описание сейчас закреплено за аккаунтом
+  const videoByAccount = {}
+  videos.forEach(v => { if (v.account_id) videoByAccount[v.account_id] = v })
+  const descByAccount = {}
+  descriptions.forEach(d => { if (d.account_id) descByAccount[d.account_id] = d })
+
+  // Свободные видео/описания той же ниши, что и аккаунт — варианты для замены
+  const freeVideosFor = (acc) =>
+    videos.filter(v => v.status === 'unassigned' && (v.niche_id ?? null) === (acc.niche_id ?? null))
+  const freeDescsFor = (acc) =>
+    descriptions.filter(d => d.status === 'unassigned' && (d.niche_id ?? null) === (acc.niche_id ?? null))
+
+  const changeVideo = async (accountId, videoId) => {
+    if (!videoId) { setEditingVideoFor(null); return }
+    try {
+      await api.assignVideo(Number(videoId), accountId)
+      setEditingVideoFor(null)
+      loadContent()
+    } catch (e) { setError(e.message) }
+  }
+
+  const changeDesc = async (accountId, descId) => {
+    if (!descId) { setEditingDescFor(null); return }
+    try {
+      await api.assignDescription(Number(descId), accountId)
+      setEditingDescFor(null)
+      loadContent()
+    } catch (e) { setError(e.message) }
+  }
 
   const doImport = async () => {
     if (!importData.trim()) return
@@ -210,6 +250,8 @@ export default function AccountsPage() {
             <th style={s.th}>Статус</th>
             <th style={s.th}>Прокси</th>
             <th style={s.th}>2FA</th>
+            <th style={s.th}>Видео</th>
+            <th style={s.th}>Описание</th>
             <th style={{ ...s.th, width: 80 }}></th>
           </tr>
         </thead>
@@ -232,13 +274,65 @@ export default function AccountsPage() {
               <td style={{ ...s.td, color: a.totp_secret ? '#3fb950' : '#484f58' }}>
                 {a.totp_secret ? '✓' : '—'}
               </td>
+              <td style={{ ...s.td, fontSize: 12, maxWidth: 180 }}>
+                {editingVideoFor === a.id ? (
+                  <select
+                    style={s.select}
+                    autoFocus
+                    defaultValue=""
+                    onChange={e => changeVideo(a.id, e.target.value)}
+                    onBlur={() => setEditingVideoFor(null)}
+                  >
+                    <option value="">— выбери видео —</option>
+                    {freeVideosFor(a).map(v => (
+                      <option key={v.id} value={v.id}>{v.filename}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <span
+                    style={{ cursor: 'pointer', color: videoByAccount[a.id] ? '#e6edf3' : '#484f58' }}
+                    onClick={() => setEditingVideoFor(a.id)}
+                    title="Нажми чтобы сменить видео"
+                  >
+                    {videoByAccount[a.id] ? videoByAccount[a.id].filename : '— нет —'} ✎
+                  </span>
+                )}
+              </td>
+              <td style={{ ...s.td, fontSize: 12, maxWidth: 220 }}>
+                {editingDescFor === a.id ? (
+                  <select
+                    style={s.select}
+                    autoFocus
+                    defaultValue=""
+                    onChange={e => changeDesc(a.id, e.target.value)}
+                    onBlur={() => setEditingDescFor(null)}
+                  >
+                    <option value="">— выбери описание —</option>
+                    {freeDescsFor(a).map(d => (
+                      <option key={d.id} value={d.id}>{d.text.slice(0, 50)}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <span
+                    style={{
+                      cursor: 'pointer', display: 'block', overflow: 'hidden',
+                      textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      color: descByAccount[a.id] ? '#e6edf3' : '#484f58',
+                    }}
+                    onClick={() => setEditingDescFor(a.id)}
+                    title={descByAccount[a.id]?.text || 'Нажми чтобы выбрать описание'}
+                  >
+                    {descByAccount[a.id] ? descByAccount[a.id].text : '— нет —'} ✎
+                  </span>
+                )}
+              </td>
               <td style={s.td}>
                 <button style={{ ...s.btn, ...s.btnDanger, padding: '4px 10px' }} onClick={() => remove(a.id)}>✕</button>
               </td>
             </tr>
           ))}
           {accounts.length === 0 && (
-            <tr><td style={{ ...s.td, color: '#8b949e' }} colSpan={7}>Нет аккаунтов. Импортируйте первые.</td></tr>
+            <tr><td style={{ ...s.td, color: '#8b949e' }} colSpan={9}>Нет аккаунтов. Импортируйте первые.</td></tr>
           )}
         </tbody>
       </table>
