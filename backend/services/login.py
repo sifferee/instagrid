@@ -855,11 +855,18 @@ class LoginOrchestrator:
                     account["username"], proxy_for_launch["server"], result.message,
                 )
             else:
-                # Внутренняя ошибка — возвращаем прокси в пул
+                # Сетевой отказ прокси (NS_ERROR_ABORT, таймаут, 429) —
+                # прокси возвращаем в пул, но помечаем как недавно
+                # использованный, чтобы следующая попытка взяла ДРУГОЙ порт.
+                # Раньше выборка шла ORDER BY id ASC и брала тот же самый:
+                # три попытки подряд били в одну и ту же нерабочую сессию.
                 from backend.database import execute, run_sync
                 await run_sync(
                     execute,
-                    "UPDATE static_proxies SET status = 'available', account_id = NULL WHERE id = ?",
+                    "UPDATE static_proxies "
+                    "SET status = 'available', account_id = NULL, "
+                    "    used_at = unixepoch('now') "
+                    "WHERE id = ?",
                     (proxy_id,),
                 )
                 logger.warning(
@@ -1068,7 +1075,7 @@ async def db_get_next_proxy(pool_id: int) -> dict[str, str] | None:
            WHERE id = (
                SELECT id FROM static_proxies
                WHERE pool_id = ? AND status = 'available' AND account_id IS NULL
-               ORDER BY id ASC LIMIT 1
+               ORDER BY COALESCE(used_at, 0) ASC, id ASC LIMIT 1
            )
            RETURNING id, host, port, username, password, protocol""",
         (pool_id,),
