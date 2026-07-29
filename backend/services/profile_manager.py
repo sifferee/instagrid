@@ -15,6 +15,7 @@ InstaGrid — Профиль-менеджер (Camoufox + BrowserForge).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
@@ -357,17 +358,31 @@ def generate_fingerprint(
         os=os_platform.value,
     )
 
-    # Ограничиваем экран выбранным пресетом, чтобы screen в fingerprint
-    # совпадал с geometry профиля. Иначе BrowserForge выдаст свой размер,
-    # и метаданные профиля разойдутся с тем, что реально видит сайт.
-    fingerprint = fg.generate(
-        screen=Screen(
-            min_width=screen_geometry.screen_width,
-            max_width=screen_geometry.screen_width,
-            min_height=screen_geometry.screen_height,
-            max_height=screen_geometry.screen_height,
-        ),
-    )
+    # Экран задаём ДИАПАЗОНОМ, а не точным значением.
+    #
+    # Раньше здесь стояло min_width == max_width == размер пресета. У
+    # BrowserForge база реальных отпечатков, и под некоторые разрешения
+    # (проверено: 1366x768 и 1536x864) настоящего Firefox под Windows в ней
+    # просто нет — генерация падала с ValueError. Пресет выбирается случайно,
+    # поэтому падало через раз.
+    #
+    # Диапазон 1280-1920 / 720-1080 проверен: 40 генераций подряд без единого
+    # отказа, на выходе обычные разрешения 1600x900 / 1680x1050 / 1920x1080.
+    try:
+        fingerprint = fg.generate(
+            screen=Screen(
+                min_width=1280, max_width=1920,
+                min_height=720, max_height=1080,
+            ),
+        )
+    except Exception as e:
+        # Подстраховка: если и диапазон не подошёл — генерируем без ограничений.
+        # Лучше нестандартное разрешение, чем упавший логин.
+        logger.warning(
+            "Fingerprint generation with screen range failed (%s), "
+            "falling back to unconstrained", type(e).__name__,
+        )
+        fingerprint = fg.generate()
 
     # BrowserForge возвращает Fingerprint-объект, конвертируем в dict для JSON
     def _to_dict(obj):
@@ -378,6 +393,82 @@ def generate_fingerprint(
         return obj
 
     return _to_dict(fingerprint)
+
+
+def _geometry_from_fingerprint(
+    fp: dict, fallback: ScreenGeometry,
+) -> ScreenGeometry:
+    """
+    Собирает ScreenGeometry по значениям из сгенерированного fingerprint.
+
+    Так метаданные профиля описывают ровно то, что Camoufox проставит в
+    браузер. Если задавать геометрию отдельно от отпечатка, эти две вещи
+    рано или поздно разойдутся.
+
+    Отсутствующие поля достраиваем по обычным пропорциям окна Windows.
+    """
+    s = fp.get("screen") or {}
+
+    def num(key: str, default: int) -> int:
+        try:
+            v = int(s.get(key) or 0)
+            return v if v > 0 else default
+        except (TypeError, ValueError):
+            return default
+
+    sw = num("width", fallback.screen_width)
+    sh = num("height", fallback.screen_height)
+    aw = num("availWidth", sw)
+    ah = num("availHeight", max(600, sh - 40))
+    ow = num("outerWidth", max(1180, min(aw - 56, round(aw * 0.967))))
+    oh = num("outerHeight", max(780, min(ah - 24, round(ah * 0.965))))
+    vw = num("innerWidth", max(800, ow - 16))
+    vh = num("innerHeight", max(600, oh - 88))
+    px = num("screenX", max(12, (sw - ow) // 2))
+
+    return ScreenGeometry(
+        screen_width=sw, screen_height=sh,
+        avail_width=aw, avail_height=ah,
+        outer_width=ow, outer_height=oh,
+        viewport_width=vw, viewport_height=vh,
+        position_x=px, position_y=18,
+        label=f"bf_{sw}x{sh}",
+    )
+
+
+def _noise_seeds(profile_id: str) -> dict[str, Any]:
+    """
+    Постоянные seed'ы шума для профиля.
+
+    Camoufox по умолчанию генерирует их заново при КАЖДОМ запуске:
+        fonts:spacing_seed = randint(1, 4_294_967_295)
+        audio:seed         = randint(1, 4_294_967_295)
+        canvas:seed        = randint(1, 4_294_967_295)
+
+    А это ровно то, что измеряет canvas- и audio-фингерпринтинг. Получалось,
+    что данные BrowserForge (UA, экран, видеокарта) закреплены за аккаунтом,
+    а хеш canvas у него меняется каждую сессию — то есть «тот же человек с
+    тем же браузером» каждый раз рисует картинку по-другому. Для трекера это
+    сигнал не хуже смены User-Agent.
+
+    Выводим seed'ы из SHA256 имени аккаунта: у каждого профиля свои,
+    но одни и те же навсегда. Camoufox их не перезапишет — его set_into
+    ставит значение только если ключа ещё нет.
+    """
+    h = hashlib.sha256(f"noise:{profile_id}".encode("utf-8", "ignore")).digest()
+
+    def take(offset: int) -> int:
+        # 1 .. 4_294_967_295 — тот же диапазон, что у Camoufox
+        return int.from_bytes(h[offset:offset + 4], "big") % 4_294_967_295 + 1
+
+    return {
+        "canvas:seed": take(0),
+        "audio:seed": take(4),
+        "fonts:spacing_seed": take(8),
+        # История браузера: Camoufox ставит случайно 1-5 при каждом старте.
+        # У живого профиля она так не скачет.
+        "window.history.length": int.from_bytes(h[12:14], "big") % 5 + 1,
+    }
 
 
 # ─── Модель профиля ──────────────────────────────────────────────────────────
@@ -529,6 +620,12 @@ class ProfileManager:
         fp_path = profile_dir / FINGERPRINT_FILE
         fp_path.write_text(json.dumps(fp, indent=2, ensure_ascii=False), encoding="utf-8")
 
+        # Геометрию берём ИЗ фингерпринта, а не назначаем отдельно.
+        # Camoufox проставляет в браузер именно эти значения, поэтому meta.json
+        # обязан описывать их же — иначе метаданные профиля разойдутся с тем,
+        # что реально видит сайт.
+        screen_geometry = _geometry_from_fingerprint(fp, screen_geometry)
+
         # Сохраняем мету
         info = ProfileInfo(
             profile_id=profile_id,
@@ -625,6 +722,7 @@ class ProfileManager:
                     screen_w=screen_w,
                     screen_h=screen_h,
                     headless=headless,
+                    profile_id=profile_id,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
 
@@ -684,6 +782,7 @@ class ProfileManager:
         screen_w: int,
         screen_h: int,
         headless: bool,
+        profile_id: str = "",
     ) -> BrowserContext:
         """Внутренний запуск Camoufox с persistent_context."""
         user_data_dir = str(profile_dir / "browser_data")
@@ -698,6 +797,12 @@ class ProfileManager:
             # Отсюда же берутся screen/outer/inner/availWidth/screenX —
             # нативно, без JS-подмены.
             "fingerprint": fingerprint,
+
+            # Постоянные seed'ы шума canvas/audio/шрифтов для этого аккаунта.
+            # Camoufox иначе генерирует их заново при каждом старте, и хеш
+            # canvas у профиля скачет от сессии к сессии. Свои значения он
+            # не перезапишет: его set_into ставит ключ только если тот пуст.
+            "config": _noise_seeds(profile_id or profile_dir.name),
 
             # ── GeoIP: timezone/locale/geolocation/WebRTC по IP прокси ──
             # Ставится ниже, в зависимости от доступности (см. _geoip_available).
