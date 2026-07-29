@@ -91,16 +91,25 @@ export default function AccountsPage() {
   }
 
   const startLogin = async () => {
-    if (!loginPoolId) { alert('Выбери пул прокси'); return }
     const ids = [...selected]
     if (!ids.length) { alert('Выбери аккаунты'); return }
+    
+    // Автовыбор пула прокси
+    const staticPools = pools.filter(p => p.pool_type === 'static')
+    if (staticPools.length === 0) { alert('Нет пулов прокси. Создай на странице Прокси.'); return }
+    const poolId = staticPools[0].id  // берём первый статический пул
+    
     setLoginRunning(true)
     try {
-      await fetch('/api/login/start', {
+      const res = await fetch('/api/login/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ account_ids: ids, pool_id: Number(loginPoolId) }),
+        body: JSON.stringify({ account_ids: ids, pool_id: poolId }),
       })
+      const data = await res.json()
+      if (!res.ok) { alert(data.detail || data.message || 'Ошибка'); setLoginRunning(false); return }
+      if (data.started === false) { alert(data.message); setLoginRunning(false); return }
+      
       const poll = setInterval(async () => {
         const res = await fetch('/api/login/status').then(r => r.json())
         setLoginState(res)
@@ -179,10 +188,6 @@ export default function AccountsPage() {
             </select>
             <button style={{ ...s.btn, ...s.btnSecondary }} onClick={doMove}>Переместить</button>
             <div style={{ width: 1, height: 20, background: '#30363d' }} />
-            <select style={s.select} value={loginPoolId} onChange={e => setLoginPoolId(e.target.value)}>
-              <option value="">Пул прокси</option>
-              {pools.filter(p => p.pool_type === 'static').map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-            </select>
             <button
               style={{ ...s.btn, background: '#1f6feb', color: '#fff', opacity: loginRunning ? 0.6 : 1 }}
               onClick={startLogin}
