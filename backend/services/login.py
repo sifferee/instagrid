@@ -31,6 +31,11 @@ from playwright.async_api import BrowserContext, Page, TimeoutError as PwTimeout
 
 from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
+from backend.services.dialog_gate import (
+    inspect_dialog, continue_after_dialog, dismiss_known_dialog,
+    verify_authenticated, set_account_public,
+    NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL,
+)
 
 logger = logging.getLogger("instagrid.login")
 
@@ -294,35 +299,31 @@ class InstagramLogin:
     # ── Cookie/GDPR попап ─────────────────────────────────────────────────
 
     async def _handle_cookies_popup(self, page: Page, human: HumanInteractor) -> None:
-        """Обрабатывает GDPR/cookie-попап если он есть."""
-        try:
-            # Пытаемся найти кнопку "Allow essential cookies only"
-            btn = await page.wait_for_selector(
-                Selectors.ADS_ESSENTIAL_ONLY,
-                timeout=3000,
+        """Обрабатывает GDPR/cookie-попап через dialog_gate (JS-based, надёжнее CSS)."""
+        dialog = await inspect_dialog(page)
+        if dialog["present"] and dialog["category"] == "cookie_consent":
+            await human.random_pause(0.5, 1.5)
+            result = await continue_after_dialog(
+                page, wait_seconds=5.0, cookie_action="decline_optional_cookies"
             )
-            if btn:
-                await human.random_pause(0.5, 1.5)
-                await human.click_element(btn)
-                logger.info("[%s] Dismissed cookie popup (essential only)", human.username)
-                await human.random_pause(1.0, 2.0)
-                return
-        except PwTimeout:
-            pass
-
-        try:
-            # Fallback — accept all
-            btn = await page.wait_for_selector(
-                Selectors.ADS_ACCEPT_ALL,
-                timeout=2000,
-            )
-            if btn:
-                await human.random_pause(0.5, 1.5)
-                await human.click_element(btn)
-                logger.info("[%s] Dismissed cookie popup (accept all)", human.username)
-                await human.random_pause(1.0, 2.0)
-        except PwTimeout:
-            logger.debug("[%s] No cookie popup found", human.username)
+            if result.get("dismissed"):
+                logger.info("[%s] Dismissed cookie popup via dialog_gate", human.username)
+            else:
+                logger.warning("[%s] Cookie popup not dismissed: %s", human.username, result.get("outcome"))
+            await human.random_pause(1.0, 2.0)
+        else:
+            # Fallback на CSS-селекторы если dialog_gate не нашёл
+            try:
+                btn = await page.wait_for_selector(
+                    Selectors.ADS_ESSENTIAL_ONLY, timeout=3000,
+                )
+                if btn:
+                    await human.random_pause(0.5, 1.5)
+                    await human.click_element(btn)
+                    logger.info("[%s] Dismissed cookie popup (CSS fallback)", human.username)
+                    await human.random_pause(1.0, 2.0)
+            except PwTimeout:
+                logger.debug("[%s] No cookie popup found", human.username)
 
     # ── Ввод credentials ──────────────────────────────────────────────────
 
@@ -489,64 +490,113 @@ class InstagramLogin:
     # ── Попапы после логина ───────────────────────────────────────────────
 
     async def _handle_post_login_popups(self, page: Page, human: HumanInteractor) -> None:
-        """Прокликивает попапы: Save Info, Notifications."""
+        """
+        Обрабатывает все попапы после логина через dialog_gate.
+        JS-based стейт-машина: классифицирует диалог, кликает семантически,
+        проверяет исчез ли, не кликает один и тот же дважды.
+        """
+        max_rounds = 5  # максимум попапов подряд
+        for round_num in range(max_rounds):
+            await human.random_pause(0.5, 1.5)
 
-        # Save Login Info → "Save info" (сохраняем куки для следующего логина)
-        await self._dismiss_popup(
-            page, human,
-            Selectors.SAVE_INFO_BUTTON,
-            "Save Login Info",
-        )
+            result = await continue_after_dialog(
+                page, allow_safe_close=True, wait_seconds=4.0,
+            )
+            outcome = result.get("outcome", "")
 
-        # Turn On Notifications → "Not Now"
-        await self._dismiss_popup(
-            page, human,
-            Selectors.NOTIFICATIONS_NOT_NOW,
-            "Notifications",
-        )
+            if outcome == NO_BLOCKER:
+                logger.debug("[%s] No blocking dialog (round %d)", human.username, round_num + 1)
+                break
 
-    async def _dismiss_popup(
-        self,
-        page: Page,
-        human: HumanInteractor,
-        selector: str,
-        popup_name: str,
-        timeout_ms: int = 5000,
-    ) -> None:
-        """Пытается найти и закрыть попап."""
-        try:
-            btn = await page.wait_for_selector(selector, timeout=timeout_ms)
-            if btn:
-                await human.random_pause(0.8, 2.0)
-                await human.click_element(btn)
-                logger.info("[%s] Dismissed popup: %s", human.username, popup_name)
-                await human.random_pause(1.0, 2.0)
-        except PwTimeout:
-            logger.debug("[%s] Popup not found: %s", human.username, popup_name)
+            if outcome == HANDLED_REEVALUATE:
+                logger.info(
+                    "[%s] Dismissed dialog: %s (round %d)",
+                    human.username, result.get("clicked_category", "?"), round_num + 1,
+                )
+                continue  # проверяем следующий попап
+
+            if outcome == TERMINAL_MANUAL:
+                state = result.get("state", "")
+                logger.warning(
+                    "[%s] Terminal dialog state: %s (round %d)",
+                    human.username, state, round_num + 1,
+                )
+                break
+
+            # TRANSITIONING_RETRY или UNKNOWN_BLOCKER
+            logger.debug("[%s] Dialog outcome %s (round %d)", human.username, outcome, round_num + 1)
+            break
+
+        await human.random_pause(0.5, 1.0)
 
     # ── Проверка залогиненности ───────────────────────────────────────────
 
     async def _verify_logged_in(self, page: Page) -> bool:
-        """Проверяет что мы реально на главной странице IG."""
+        """
+        API-based проверка аутентификации (порт из SparkGrid).
+
+        Множественная корроборация:
+        1. API endpoint /api/v1/accounts/current_user/ — 100% надёжен
+        2. UI: auth_nav + account_menu + app_shell (≥2 из 3)
+        3. Session cookies: sessionid + csrftoken + ds_user_id
+        4. Отсутствие login form
+
+        Confirmed = API OK || (≥2 UI + cookie && no login form)
+        """
+        # Ждём загрузку страницы
         try:
-            await page.wait_for_selector(
-                f"{Selectors.NAV_BAR}, {Selectors.HOME_FEED}",
-                timeout=10_000,
+            await page.wait_for_load_state("domcontentloaded", timeout=10_000)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+
+        auth = await verify_authenticated(page)
+        if auth["confirmed"]:
+            logger.info(
+                "[verify] Auth confirmed: %s (evidence: %s)",
+                auth["reason"], auth["evidence"],
             )
-            current_url = page.url
-            if "login" in current_url or "challenge" in current_url:
-                return False
             return True
-        except PwTimeout:
-            return False
+
+        # Retry через 3 секунды (Instagram SPA может ещё грузиться)
+        await asyncio.sleep(3.0)
+        auth = await verify_authenticated(page)
+        if auth["confirmed"]:
+            logger.info("[verify] Auth confirmed on retry: %s", auth["reason"])
+            return True
+
+        logger.warning(
+            "[verify] Auth NOT confirmed: %s (evidence: %s)",
+            auth["reason"], auth["evidence"],
+        )
+        return False
 
     # ── Отключение приватного профиля ─────────────────────────────────────
 
     async def _disable_private_profile(self, page: Page, human: HumanInteractor) -> None:
-        """Заходит в настройки приватности и отключает private account."""
-        try:
-            logger.info("[%s] Navigating to privacy settings", human.username)
+        """
+        Отключает приватный профиль через Instagram API (не UI-селекторы).
+        Порт из SparkGrid account_privacy.py.
 
+        API-based подход не ломается при смене дизайна.
+        """
+        try:
+            logger.info("[%s] Checking privacy via API", human.username)
+            result = await set_account_public(page)
+            if result:
+                logger.info("[%s] Profile confirmed public via API", human.username)
+            else:
+                logger.warning("[%s] API privacy toggle failed, trying UI fallback", human.username)
+                await self._disable_private_profile_ui_fallback(page, human)
+        except Exception as e:
+            logger.warning("[%s] Privacy check error: %s, trying UI fallback", human.username, e)
+            await self._disable_private_profile_ui_fallback(page, human)
+
+    async def _disable_private_profile_ui_fallback(
+        self, page: Page, human: HumanInteractor,
+    ) -> None:
+        """UI fallback для отключения приватности (если API не работает)."""
+        try:
             await page.goto(
                 INSTAGRAM_PRIVACY_URL,
                 wait_until="domcontentloaded",
@@ -554,11 +604,8 @@ class InstagramLogin:
             )
             await human.random_pause(1.5, 3.0)
 
-            # Ищем тоггл Private Account
             label = await page.query_selector(Selectors.PRIVATE_ACCOUNT_LABEL)
             if not label:
-                # Пробуем альтернативный путь
-                # Некоторые версии IG используют Settings → Privacy → Account Privacy
                 await page.goto(
                     "https://www.instagram.com/accounts/who_can_see_your_content/",
                     wait_until="domcontentloaded",
@@ -568,19 +615,15 @@ class InstagramLogin:
                 label = await page.query_selector(Selectors.PRIVATE_ACCOUNT_LABEL)
 
             if not label:
-                logger.warning("[%s] Private account toggle not found", human.username)
+                logger.warning("[%s] Private account toggle not found (UI fallback)", human.username)
                 return
 
-            # Проверяем текущее состояние
             toggle = await page.query_selector(Selectors.PRIVATE_ACCOUNT_TOGGLE)
             if toggle:
                 is_checked = await toggle.is_checked()
                 if is_checked:
-                    # Приватный — отключаем
                     await human.click_element(toggle)
                     await human.random_pause(1.0, 2.0)
-
-                    # Может быть confirmation dialog
                     try:
                         confirm = await page.wait_for_selector(
                             '//button[contains(text(), "Switch to Public") or contains(text(), "Turn Off")]',
@@ -588,23 +631,23 @@ class InstagramLogin:
                         )
                         if confirm:
                             await human.click_element(confirm)
-                            logger.info("[%s] Disabled private profile", human.username)
+                            logger.info("[%s] Disabled private profile (UI fallback)", human.username)
                     except PwTimeout:
-                        logger.info("[%s] Private toggle clicked, no confirm needed", human.username)
+                        logger.info("[%s] Private toggle clicked (UI fallback)", human.username)
                 else:
-                    logger.info("[%s] Profile already public", human.username)
-            else:
-                logger.warning("[%s] Could not find privacy toggle element", human.username)
-
+                    logger.info("[%s] Profile already public (UI fallback)", human.username)
         except Exception as e:
-            logger.warning("[%s] Failed to disable private profile: %s", human.username, e)
+            logger.warning("[%s] UI privacy fallback failed: %s", human.username, e)
 
         # Возвращаемся на главную
-        await page.goto(
-            "https://www.instagram.com/",
-            wait_until="domcontentloaded",
-            timeout=PAGE_LOAD_TIMEOUT,
-        )
+        try:
+            await page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=PAGE_LOAD_TIMEOUT,
+            )
+        except Exception:
+            pass
         await human.random_pause(1.0, 2.0)
 
 

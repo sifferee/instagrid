@@ -27,6 +27,9 @@ from playwright.async_api import Page, BrowserContext
 from backend.database import execute, execute_many, query, query_one, get_db, run_sync
 from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
+from backend.services.dialog_gate import (
+    inspect_dialog, continue_after_dialog, verify_authenticated,
+)
 
 logger = logging.getLogger("instagrid.checker")
 

@@ -36,6 +36,10 @@ from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
 from backend.services.content_manager import ContentManager
 from backend.services.mobile_proxy import MobileProxyRotator
+from backend.services.dialog_gate import (
+    inspect_dialog, continue_after_dialog,
+    NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL,
+)
 
 logger = logging.getLogger("instagrid.posting")
 
@@ -171,8 +175,8 @@ class FeedWarmer:
 
         while time.time() < end_time:
             action = random.choices(
-                ["scroll", "like", "dwell", "reels", "comments"],
-                weights=[40, 20, 20, 10, 10],
+                ["scroll", "like", "dwell", "wander", "reels", "comments"],
+                weights=[35, 15, 15, 15, 10, 10],
                 k=1,
             )[0]
 
@@ -185,6 +189,8 @@ class FeedWarmer:
                         likes_given += 1
                 elif action == "dwell":
                     await self.human.dwell()
+                elif action == "wander":
+                    await self.human.wander(moves=random.randint(1, 2))
                 elif action == "reels":
                     await self._browse_reels()
                 elif action == "comments":
@@ -354,19 +360,60 @@ class ReelPoster:
             await self.human.click_element(btn)
 
     async def _wait_confirmation(self) -> bool:
-        """Ждёт подтверждения что рилс опубликован."""
-        try:
-            await self.page.wait_for_selector(
-                f"{PostSelectors.SHARED_CONFIRMATION}, {PostSelectors.POST_SHARED}",
-                timeout=UPLOAD_CONFIRM_TIMEOUT,
-            )
-            return True
-        except PwTimeout:
-            # Fallback: проверяем URL или другие признаки
-            url = self.page.url
-            if "/reel/" in url or "/p/" in url:
+        """
+        Ждёт подтверждения что рилс опубликован.
+        Использует dialog_gate для детекции operation_processing → operation_success.
+        Также обрабатывает policy_notice ("We removed your post") — критический кейс.
+        """
+        deadline = time.time() + UPLOAD_CONFIRM_TIMEOUT / 1000.0
+
+        while time.time() < deadline:
+            dialog = await inspect_dialog(self.page)
+            category = dialog.get("category", "")
+
+            if category == "operation_success":
+                logger.info("[%s] Reel share confirmed via dialog_gate", self.human.username)
+                # Закрываем диалог успеха
+                await continue_after_dialog(self.page, allow_safe_close=True, wait_seconds=3.0)
                 return True
-            return False
+
+            if category == "operation_processing":
+                # Ещё грузится — ждём
+                await asyncio.sleep(1.0)
+                continue
+
+            if category == "policy_notice":
+                # "We removed your post" — бан видео
+                logger.warning("[%s] policy_notice: post removed by Instagram", self.human.username)
+                await continue_after_dialog(self.page, allow_safe_close=True, wait_seconds=3.0)
+                return False
+
+            if category in {"restriction", "suspended", "checkpoint"}:
+                logger.warning("[%s] Account issue detected during posting: %s", self.human.username, category)
+                return False
+
+            # Нет диалога — проверяем CSS fallback и URL
+            if not dialog.get("present"):
+                url = self.page.url
+                if "/reel/" in url or "/p/" in url:
+                    return True
+                # CSS fallback
+                try:
+                    el = await self.page.query_selector(
+                        f"{PostSelectors.SHARED_CONFIRMATION}, {PostSelectors.POST_SHARED}"
+                    )
+                    if el:
+                        return True
+                except Exception:
+                    pass
+
+            await asyncio.sleep(1.0)
+
+        # Timeout — последняя проверка
+        url = self.page.url
+        if "/reel/" in url or "/p/" in url:
+            return True
+        return False
 
 
 # ─── Сессия постинга (N рилсов + прогрев) ────────────────────────────────────

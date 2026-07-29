@@ -22,6 +22,9 @@ PORT = int(os.environ.get("INSTAGRID_PORT", "8000"))
 # Claude API для автогенерации описаний (опционально)
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
+# Human interactor speed multiplier (INSTAGRID_SPEED=0.5 → всё вдвое быстрее, для тестов)
+SPEED_MULTIPLIER = float(os.environ.get("INSTAGRID_SPEED", "1.0"))
+
 # Мобильный прокси: макс аккаунтов на один пул
 MOBILE_POOL_MAX_ACCOUNTS = 45
 
