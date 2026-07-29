@@ -414,6 +414,10 @@ class ReelPoster:
             # 2. Загружаем видео
             if not await self._attach_video(video_path):
                 logger.error("[%s] Could not attach video", username)
+                await capture_error_report(
+                    self.page, username, "video_attach_failed",
+                    extra={"video_path": video_path},
+                )
                 return False
 
             # Сразу после прикрепления видео Instagram иногда показывает
@@ -448,9 +452,17 @@ class ReelPoster:
 
         except PwTimeout as e:
             logger.error("[%s] Timeout posting reel: %s", username, e)
+            await capture_error_report(
+                self.page, username, "post_reel_timeout",
+                extra={"video_path": video_path, "timeout_detail": str(e)},
+            )
             return False
         except Exception as e:
             logger.exception("[%s] Error posting reel", username)
+            await capture_error_report(
+                self.page, username, "post_reel_exception",
+                extra={"video_path": video_path, "exception_type": type(e).__name__, "exception_message": str(e)},
+            )
             return False
 
     async def _attach_video(self, video_path: str) -> bool:
@@ -533,6 +545,7 @@ class ReelPoster:
                 await self.human.random_pause(0.5, 1.5)
         except PwTimeout:
             logger.warning("[%s] Caption input not found, posting without caption", self.human.username)
+            await capture_error_report(self.page, self.human.username, "caption_input_not_found")
 
     async def _click_share(self) -> None:
         """Нажимает кнопку Share."""
@@ -575,6 +588,7 @@ class ReelPoster:
 
             if category in {"restriction", "suspended", "checkpoint"}:
                 logger.warning("[%s] Account issue detected during posting: %s", self.human.username, category)
+                await capture_error_report(self.page, self.human.username, f"posting_{category}")
                 return False
 
             # Нет диалога — проверяем CSS fallback и URL
@@ -598,6 +612,7 @@ class ReelPoster:
         url = self.page.url
         if "/reel/" in url or "/p/" in url:
             return True
+        await capture_error_report(self.page, self.human.username, "confirmation_timeout")
         return False
 
 
