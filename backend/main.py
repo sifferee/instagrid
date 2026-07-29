@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from backend.config import setup_logging
 from backend.database import init_db
 from backend.routers import niches, accounts, proxies, content, posting, stories, checker
+from backend.routers import login as login_router
 
 
 # Fix #13: lifespan вместо deprecated on_event("startup")
@@ -44,6 +45,7 @@ app.include_router(content.router)
 app.include_router(posting.router)
 app.include_router(stories.router)
 app.include_router(checker.router)
+app.include_router(login_router.router)
 
 
 # Serve React build

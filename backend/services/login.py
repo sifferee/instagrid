@@ -97,8 +97,9 @@ class Selectors:
     NAV_BAR = 'nav[role="navigation"]'
 
     # Настройки приватности
-    PRIVATE_ACCOUNT_TOGGLE = 'input[type="checkbox"]'  # на странице privacy
-    PRIVATE_ACCOUNT_LABEL = '//label[contains(text(), "Private account") or contains(text(), "Private Account")]'
+    # Приватность
+    PRIVATE_ACCOUNT_TOGGLE = 'input[type="checkbox"], [role="switch"], [role="checkbox"]'
+    PRIVATE_ACCOUNT_LABEL = '//span[contains(text(), "Private account") or contains(text(), "Private Account")] | //label[contains(text(), "Private account")]'
 
 
 # ─── Результат логина ─────────────────────────────────────────────────────────
@@ -186,6 +187,11 @@ class InstagramLogin:
                 human = HumanInteractor(page, username)
                 logger.info("[%s] Profile launched, behavior=%s", username, human.profile.value)
 
+                # Автосборщик селекторов
+                from backend.services.selector_collector import SelectorCollector
+                collector = SelectorCollector(page, username)
+                await collector.start()
+
                 # 2. Навигация на страницу логина
                 await self._navigate_to_login(page, human)
 
@@ -236,9 +242,13 @@ class InstagramLogin:
             result.duration_sec = time.time() - start_time
             result.attempts = 1
 
-            # Не закрываем контекст при успешном логине — он нужен для дальнейшей работы
-            if not result.success and context:
-                await self.pm.close_profile(username)
+            # Всегда закрываем браузер — профиль (куки) уже сохранён на диске
+            if context:
+                try:
+                    await self.pm.close_profile(username)
+                    logger.info("[%s] Browser closed", username)
+                except Exception as e:
+                    logger.debug("[%s] Browser close error: %s", username, e)
 
         return result
 

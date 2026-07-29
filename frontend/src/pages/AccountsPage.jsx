@@ -22,6 +22,7 @@ const STATUS_LABELS = { new: 'Новый', logged_in: 'Залогинен', cool
 export default function AccountsPage() {
   const [accounts, setAccounts] = useState([])
   const [niches, setNiches] = useState([])
+  const [pools, setPools] = useState([])
   const [filterNiche, setFilterNiche] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [showImport, setShowImport] = useState(false)
@@ -31,6 +32,9 @@ export default function AccountsPage() {
   const [selected, setSelected] = useState(new Set())
   const [moveNiche, setMoveNiche] = useState('')
   const [error, setError] = useState('')
+  const [loginPoolId, setLoginPoolId] = useState('')
+  const [loginState, setLoginState] = useState(null)
+  const [loginRunning, setLoginRunning] = useState(false)
 
   const load = () => {
     const params = {}
@@ -39,7 +43,10 @@ export default function AccountsPage() {
     api.getAccounts(params).then(setAccounts).catch(e => setError(e.message))
   }
 
-  useEffect(() => { api.getNiches().then(setNiches) }, [])
+  useEffect(() => {
+    api.getNiches().then(setNiches)
+    fetch('/api/proxies/pools').then(r => r.json()).then(setPools).catch(() => {})
+  }, [])
   useEffect(() => { load() }, [filterNiche, filterStatus])
 
   const doImport = async () => {
@@ -81,6 +88,32 @@ export default function AccountsPage() {
       setSelected(new Set())
       load()
     } catch (e) { setError(e.message) }
+  }
+
+  const startLogin = async () => {
+    if (!loginPoolId) { alert('Выбери пул прокси'); return }
+    const ids = [...selected]
+    if (!ids.length) { alert('Выбери аккаунты'); return }
+    setLoginRunning(true)
+    try {
+      await fetch('/api/login/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ account_ids: ids, pool_id: Number(loginPoolId) }),
+      })
+      const poll = setInterval(async () => {
+        const res = await fetch('/api/login/status').then(r => r.json())
+        setLoginState(res)
+        if (!res.running) {
+          clearInterval(poll)
+          setLoginRunning(false)
+          load()
+        }
+      }, 2000)
+    } catch (e) {
+      alert(e.message)
+      setLoginRunning(false)
+    }
   }
 
   return (
@@ -145,6 +178,18 @@ export default function AccountsPage() {
               {niches.map(n => <option key={n.id} value={n.id}>{n.name}</option>)}
             </select>
             <button style={{ ...s.btn, ...s.btnSecondary }} onClick={doMove}>Переместить</button>
+            <div style={{ width: 1, height: 20, background: '#30363d' }} />
+            <select style={s.select} value={loginPoolId} onChange={e => setLoginPoolId(e.target.value)}>
+              <option value="">Пул прокси</option>
+              {pools.filter(p => p.pool_type === 'static').map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <button
+              style={{ ...s.btn, background: '#1f6feb', color: '#fff', opacity: loginRunning ? 0.6 : 1 }}
+              onClick={startLogin}
+              disabled={loginRunning}
+            >
+              {loginRunning ? `Логин... (${loginState?.done || 0}/${loginState?.total || 0})` : 'Логин'}
+            </button>
           </>
         )}
       </div>
@@ -192,6 +237,27 @@ export default function AccountsPage() {
           )}
         </tbody>
       </table>
+
+      {loginState && loginState.results && loginState.results.length > 0 && (
+        <div style={{ ...s.card, marginTop: 16 }}>
+          <h3 style={{ margin: '0 0 12px', fontSize: 15, color: '#e6edf3' }}>
+            Результаты логина ({loginState.success} ✓ / {loginState.failed} ✗)
+          </h3>
+          {loginState.results.map((r, i) => (
+            <div key={i} style={{
+              display: 'flex', gap: 12, padding: '6px 0', borderBottom: '1px solid #21262d',
+              fontSize: 13, alignItems: 'center',
+            }}>
+              <span style={{ color: r.success ? '#3fb950' : '#f85149', fontWeight: 600 }}>
+                {r.success ? '✓' : '✗'}
+              </span>
+              <span style={{ color: '#e6edf3', minWidth: 140 }}>{r.username}</span>
+              <span style={s.badge(r.success ? '#3fb950' : '#f85149')}>{r.status}</span>
+              <span style={{ color: '#8b949e', flex: 1 }}>{r.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
