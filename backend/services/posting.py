@@ -41,7 +41,7 @@ from backend.services.mobile_proxy import MobileProxyRotator
 from backend.services.scheduler import is_within_active_window, next_session_at
 from backend.services.dialog_gate import (
     inspect_dialog, continue_after_dialog, verify_authenticated,
-    click_button_by_text, diagnose_unknown_state,
+    click_button_by_text, capture_error_report,
     NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL, UNKNOWN_BLOCKER,
 )
 
@@ -90,14 +90,14 @@ async def _clear_blocking_dialogs(page, username: str, wait_seconds: float = 6.0
                 "[%s] Blocking dialog present, not auto-dismissed (state=%s) — needs manual look",
                 username, result.get("state"),
             )
-            await diagnose_unknown_state(
+            await capture_error_report(
                 page, username, "terminal_manual_dialog",
                 fingerprint=result.get("fingerprint", ""),
             )
 
         elif outcome == UNKNOWN_BLOCKER:
             logger.warning("[%s] Unknown popup blocking the page — collecting diagnostics", username)
-            await diagnose_unknown_state(
+            await capture_error_report(
                 page, username, "unknown_dialog",
                 fingerprint=result.get("fingerprint", ""),
             )
@@ -161,7 +161,7 @@ async def _recover_logged_out_session(page, human, account: dict[str, Any]) -> b
         return True
 
     logger.error("[%s] Could not recover logged-out session", username)
-    await diagnose_unknown_state(page, username, "relogin_failed")
+    await capture_error_report(page, username, "relogin_failed")
     return False
 
 

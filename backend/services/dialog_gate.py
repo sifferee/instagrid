@@ -191,13 +191,17 @@ async def click_button_by_text(page, text: str) -> bool:
 
 # ─── Диагностика неизвестного состояния страницы ────────────────────────────
 
-def _seen_fingerprints_path():
+def _debug_reports_dir():
     from pathlib import Path as _P
-    return _P("logs") / "screenshots" / "seen_fingerprints.txt"
+    return _P("debug_reports")
+
+
+def _seen_fingerprints_path():
+    return _debug_reports_dir() / ".seen_fingerprints.txt"
 
 
 def _already_captured(fingerprint: str) -> bool:
-    """Проверяет, снимали ли уже скрин именно для этого отпечатка попапа."""
+    """Проверяет, снимали ли уже отчёт именно для этого отпечатка попапа."""
     if not fingerprint:
         return False
     path = _seen_fingerprints_path()
@@ -221,43 +225,67 @@ def _mark_captured(fingerprint: str) -> None:
         pass
 
 
-async def diagnose_unknown_state(page, username: str, tag: str, fingerprint: str = "") -> None:
+async def capture_error_report(
+    page,
+    username: str,
+    tag: str,
+    fingerprint: str = "",
+    extra: dict[str, Any] | None = None,
+) -> None:
     """
-    Снимает скриншот + текст страницы, когда встретилось что-то незнакомое
-    (unknown_dialog, не удалось восстановить сессию и т.п.).
+    Полный отчёт об ошибке: скриншот + вся HTML-разметка страницы + видимый
+    текст/кнопки + любые дополнительные данные (текст исключения, URL и т.п.).
 
-    Сохраняет в logs/screenshots/ — это и есть тот самый "сбор данных на будущее":
-    периодически просматривай эту папку, и по накопленным примерам можно будет
-    дописать новую категорию прямо в _INSPECT_JS выше.
+    Сохраняется в debug_reports/<время>_<аккаунт>_<тег>/ — ЭТА ПАПКА
+    коммитится в git (не в .gitignore), чтобы отчёты можно было в любой
+    момент открыть на любой машине и разобрать вместе. Три файла внутри:
+      - screenshot.png — как это выглядело
+      - page.html — полный HTML на момент ошибки (для разбора селекторов)
+      - report.md  — читаемая сводка: время, аккаунт, URL, текст, кнопки,
+                      что передали в extra (например текст исключения)
 
-    Если передан fingerprint и точно такой же попап уже был сфотографирован
-    раньше (в т.ч. на другом аккаунте — текст попапа не зависит от аккаунта) —
-    новый скрин не делается, только короткая строка в лог. Так не копится
-    гора одинаковых картинок с одним и тем же незнакомым попапом.
-
-    Портировано из login.py::_diagnose_page (там уже проверено на практике),
-    здесь — как отдельная переиспользуемая функция для posting.py и других мест.
+    Если передан fingerprint и точно такой же случай уже зафиксирован
+    раньше — новый отчёт не создаётся, только строка в лог. Так по-настоящему
+    одинаковые повторения (один и тот же незнакомый попап, встреченный
+    десятки раз подряд в одной залипшей сессии) не заваливают репозиторий
+    полными дублями. Разные по сути ошибки (падения кода, разные аккаунты,
+    разные URL) — fingerprint не передавайте, тогда отчёт создаётся всегда.
     """
     if fingerprint and _already_captured(fingerprint):
         logger.info(
-            "[%s] Уже видели этот попап раньше (fingerprint=%s...), скрин уже есть, пропускаю",
+            "[%s] Такой случай уже зафиксирован (fingerprint=%s...), отчёт уже есть, пропускаю",
             username, fingerprint[:10],
         )
         return
 
     from pathlib import Path as _P
+    import json as _json
     import time as _t
 
+    stamp = _t.strftime("%Y%m%d_%H%M%S")
+    report_dir = _debug_reports_dir() / f"{stamp}_{username}_{tag}"
+
     try:
-        shots = _P("logs") / "screenshots"
-        shots.mkdir(parents=True, exist_ok=True)
-        stamp = _t.strftime("%Y%m%d_%H%M%S")
-        shot = shots / f"{stamp}_{username}_{tag}.png"
-        await page.screenshot(path=str(shot), full_page=False)
-        logger.warning("[%s] Unknown state screenshot: %s", username, shot)
+        report_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.debug("[%s] Could not create debug_reports dir: %s", username, e)
+        return
+
+    # Скриншот
+    try:
+        await page.screenshot(path=str(report_dir / "screenshot.png"), full_page=False)
     except Exception as e:
         logger.debug("[%s] Screenshot failed: %s", username, e)
 
+    # Полный HTML
+    try:
+        html = await page.content()
+        (report_dir / "page.html").write_text(html, encoding="utf-8")
+    except Exception as e:
+        logger.debug("[%s] HTML capture failed: %s", username, e)
+
+    # Видимый текст + кнопки + заголовок + текущий URL
+    info: dict[str, Any] = {}
     try:
         info = await page.evaluate("""() => {
             const vis = (el) => {
@@ -271,18 +299,44 @@ async def diagnose_unknown_state(page, username: str, tag: str, fingerprint: str
             return {
                 title: clean(document.title),
                 url: location.href,
-                bodyStart: clean(document.body ? document.body.innerText : '').slice(0, 400),
-                buttons: [...new Set(buttons)].slice(0, 15),
+                lang: document.documentElement.lang || '',
+                bodyText: clean(document.body ? document.body.innerText : '').slice(0, 2000),
+                buttons: [...new Set(buttons)].slice(0, 25),
             };
         }""")
-        logger.warning("[%s] -- ДИАГНОСТИКА НЕИЗВЕСТНОГО СОСТОЯНИЯ (%s) --", username, tag)
-        logger.warning("[%s]   url     : %s", username, str(info.get("url", ""))[:120])
-        logger.warning("[%s]   title   : %s", username, str(info.get("title", ""))[:90])
-        logger.warning("[%s]   buttons : %s", username, info.get("buttons", []))
-        logger.warning("[%s]   body    : %s", username, str(info.get("bodyStart", ""))[:300])
     except Exception as e:
-        logger.debug("[%s] Page diagnostics failed: %s", username, e)
+        logger.debug("[%s] Page text extraction failed: %s", username, e)
 
+    # Читаемый отчёт
+    try:
+        lines = [
+            f"# Отчёт об ошибке: {tag}",
+            "",
+            f"- **Аккаунт:** {username}",
+            f"- **Время:** {stamp}",
+            f"- **URL:** {info.get('url', '')}",
+            f"- **Заголовок страницы:** {info.get('title', '')}",
+            f"- **Язык страницы:** {info.get('lang', '') or 'не определён'}",
+            "",
+        ]
+        if extra:
+            lines.append("## Дополнительные данные")
+            for k, v in extra.items():
+                lines.append(f"- **{k}:** {v}")
+            lines.append("")
+        lines.append("## Видимые кнопки на странице")
+        for b in info.get("buttons", []):
+            lines.append(f"- {b}")
+        lines.append("")
+        lines.append("## Видимый текст страницы (первые 2000 символов)")
+        lines.append("```")
+        lines.append(str(info.get("bodyText", "")))
+        lines.append("```")
+        (report_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    except Exception as e:
+        logger.debug("[%s] Report write failed: %s", username, e)
+
+    logger.warning("[%s] Отчёт об ошибке (%s) сохранён: %s", username, tag, report_dir)
     _mark_captured(fingerprint)
 
 

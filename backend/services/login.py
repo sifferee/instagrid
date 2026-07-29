@@ -34,11 +34,37 @@ from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
 from backend.services.dialog_gate import (
     inspect_dialog, continue_after_dialog, dismiss_known_dialog,
-    verify_authenticated, set_account_public,
+    verify_authenticated, set_account_public, capture_error_report,
     NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL,
 )
 
 logger = logging.getLogger("instagrid.login")
+
+
+class AccountBlockedError(Exception):
+    """
+    Instagram показал не форму логина, а блокирующую страницу —
+    suspended/challenge/disabled — вместо того чтобы просто не загрузиться.
+
+    Раньше это ловилось как обычный таймаут ожидания поля username и
+    трактовалось как "внутренняя ошибка кода" — аккаунт тратил ещё 2
+    попытки с другими прокси, каждый раз попадая в ту же стену (проблема
+    не в прокси), и в итоге просто оставался в статусе 'new' без единой
+    внятной записи о том, что произошло.
+    """
+
+    def __init__(self, state: str, url: str) -> None:
+        self.state = state
+        self.url = url
+        super().__init__(f"{state} page: {url}")
+
+
+# По каким кускам URL узнаём, что это не лаг загрузки, а настоящая стена
+BLOCKED_URL_MARKERS = {
+    "suspended": "/accounts/suspended/",
+    "challenge": "/challenge/",
+    "disabled": "/accounts/disabled/",
+}
 
 
 # ─── Константы ────────────────────────────────────────────────────────────────
@@ -239,10 +265,23 @@ class InstagramLogin:
             result.message = f"Hard timeout ({HARD_TIMEOUT}s) exceeded"
             logger.error("[%s] Hard timeout exceeded", username)
 
+        except AccountBlockedError as e:
+            # Отчёт уже сохранён внутри _navigate_to_login в момент обнаружения.
+            # Здесь только классификация: НЕ internal error, прокси не виноват,
+            # аккаунт не мёртвый — просто отлёжка, ротация прокси не поможет.
+            result.status = AccountStatus.COOLDOWN
+            result.message = f"Account blocked ({e.state}): {e.url}"
+            logger.warning("[%s] Blocked page detected: %s (%s)", username, e.state, e.url)
+
         except Exception as e:
             result.status = AccountStatus.COOLDOWN
             result.message = f"Unexpected error: {e}"
             logger.exception("[%s] Login error", username)
+            if page:
+                await capture_error_report(
+                    page, username, "login_exception",
+                    extra={"exception_type": type(e).__name__, "exception_message": str(e)},
+                )
 
         finally:
             result.duration_sec = time.time() - start_time
@@ -278,6 +317,15 @@ class InstagramLogin:
                 return
 
             except PwTimeout:
+                current_url = str(getattr(page, "url", "") or "")
+                for state, marker in BLOCKED_URL_MARKERS.items():
+                    if marker in current_url:
+                        await capture_error_report(
+                            page, human.username, f"login_{state}",
+                            extra={"detected_url": current_url, "attempt": attempt},
+                        )
+                        raise AccountBlockedError(state, current_url)
+
                 logger.warning(
                     "[%s] Page load timeout attempt %d/%d",
                     human.username, attempt, MAX_PAGE_RELOAD_RETRIES,
@@ -836,14 +884,26 @@ class LoginOrchestrator:
             consecutive_failures += 1
             last_result = result
 
-            if "challenge" in result.message.lower():
-                # Challenge → cooldown 24ч, прокси НЕ удаляем (не его вина)
+            if any(k in result.message.lower() for k in ("challenge", "blocked", "suspended", "disabled")):
+                # Challenge/suspended/disabled → cooldown 24ч, прокси НЕ удаляем (не его вина),
+                # и НЕ пробуем ещё раз с другим прокси — проблема не в прокси, а в самом
+                # аккаунте/сессии, повтор с новым IP только повторит ту же стену.
+                from backend.database import execute, run_sync
+                await run_sync(
+                    execute,
+                    "UPDATE static_proxies "
+                    "SET status = 'available', account_id = NULL, "
+                    "    used_at = unixepoch('now') "
+                    "WHERE id = ?",
+                    (proxy_id,),
+                )
+                await self.pm.close_profile(account["username"])
                 await self._update_status(
                     account["id"],
                     AccountStatus.COOLDOWN.value,
-                    "Challenge required — cooldown 24h",
+                    f"Blocked — cooldown 24h ({result.message})",
                 )
-                logger.warning("[%s] Challenge → cooldown", account["username"])
+                logger.warning("[%s] Blocked/challenge → cooldown, no retry", account["username"])
                 return result
 
             # Удаляем прокси ТОЛЬКО если Instagram реально ответил (неверный пароль).
