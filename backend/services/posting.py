@@ -416,6 +416,13 @@ class ReelPoster:
                 logger.error("[%s] Could not attach video", username)
                 return False
 
+            # Сразу после прикрепления видео Instagram иногда показывает
+            # одноразовые информационные попапы (например "Video posts are
+            # now shared as reels") — если их не закрыть, все следующие шаги
+            # (Next/Caption/Share) будут вслепую упираться в таймаут, потому
+            # что попап перекрывает нужные кнопки.
+            await _clear_blocking_dialogs(self.page, username, wait_seconds=3.0)
+
             # 3. Ждём обработку. Курсор при этом не должен стоять колом —
             # живой человек за 3-6 секунд шевелит мышью.
             await self.human.random_pause(1.0, 2.0)

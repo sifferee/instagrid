@@ -95,6 +95,8 @@ _INSPECT_JS = """() => {
     return result('policy_notice');
   if (text.includes('turn on notifications') && text.includes('not now'))
     return result('notification');
+  if (/(video posts are now shared as reels|your account is public, so anyone can discover)/.test(text) && labels.includes('ok'))
+    return result('reels_notice');
   if (/(challenge|checkpoint|confirm it'?s you|help us confirm|verification)/.test(text))
     return result('checkpoint');
   if (/(try again later|we restrict|restricted|suspicious)/.test(text))
@@ -406,6 +408,7 @@ async def _semantic_action(page, action: str) -> bool:
         "decline_optional_cookies": "decline optional cookies",
         "not_now": "not now",
         "close": "close",
+        "ok": "ok",
     }.get(action)
     if not wanted:
         return False
@@ -422,6 +425,7 @@ async def dismiss_known_dialog(page, category: str) -> bool:
         "save_login": "not_now",
         "notification": "not_now",
         "policy_notice": "close",
+        "reels_notice": "ok",
     }.get(str(category or ""))
     return bool(action and await _semantic_action(page, action))
 
@@ -516,12 +520,13 @@ async def continue_after_dialog(
                     "fresh_reads": fresh_reads, "stable_reads": 0,
                 }
 
-        elif category in {"policy_notice", "cookie_consent", "notification", "save_login"}:
+        elif category in {"policy_notice", "cookie_consent", "notification", "save_login", "reels_notice"}:
             action = {
                 "policy_notice": "close",
                 "cookie_consent": cookie_action,
                 "notification": "not_now",
                 "save_login": "not_now",
+                "reels_notice": "ok",
             }[category]
             allowed = category != "policy_notice" or allow_safe_close
             fingerprint = str(observed.get("fingerprint") or category)
