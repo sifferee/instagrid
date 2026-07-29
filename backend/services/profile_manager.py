@@ -218,15 +218,20 @@ class GeoIPResolver:
 
     def __init__(self, db_path: str | None = None) -> None:
         self._reader = None
-        self._db_path = db_path or "GeoLite2-City.mmdb"
+        # Если путь не задан — берём базу, скачанную `camoufox fetch`
+        self._db_path = db_path or _find_camoufox_mmdb() or "GeoLite2-City.mmdb"
         try:
             import geoip2.database
             p = Path(self._db_path)
             if p.exists():
                 self._reader = geoip2.database.Reader(str(p))
-                logger.info("GeoIP2 database loaded: %s", p)
+                logger.info("GeoIP2 database loaded: %s", p.name)
             else:
-                logger.warning("GeoIP2 database not found at %s, using fallback timezone", p)
+                logger.warning(
+                    "GeoIP2 database not found (%s). Timezone falls back to "
+                    "America/New_York. Run `python -m camoufox fetch` to get one.",
+                    p,
+                )
         except ImportError:
             logger.warning("geoip2 not installed, using fallback timezone")
 
@@ -249,34 +254,81 @@ class GeoIPResolver:
             self._reader = None
 
 
+def _find_camoufox_mmdb() -> str | None:
+    """
+    Ищет базу GeoIP, скачанную командой `python -m camoufox fetch`.
+
+    Camoufox кладёт её в свой кеш-каталог. Если нашли — используем и для
+    нашего резолвера тоже, чтобы не заставлять качать GeoLite2 отдельно.
+    """
+    try:
+        from platformdirs import user_cache_dir
+        base = Path(user_cache_dir("camoufox"))
+    except Exception:
+        return None
+
+    for root in (base / "geoip", base):
+        for pattern in ("mmdb/*.mmdb", "*.mmdb", "**/*.mmdb"):
+            try:
+                found = sorted(root.glob(pattern))
+                if found:
+                    # Предпочитаем City-базу — в ней есть timezone
+                    city = [p for p in found if "city" in p.name.lower()]
+                    return str(city[0] if city else found[0])
+            except Exception:
+                continue
+    return None
+
+
 def _geoip_available() -> bool:
     """
     Доступен ли нативный geoip Camoufox.
 
-    geoip=True требует maxminddb (тянется вместе с geoip2) и скачанную базу
-    Camoufox. Если чего-то нет — Camoufox бросает исключение на КАЖДОМ запуске
-    профиля. Проверяем один раз и при проблеме тихо откатываемся на ручной
-    timezone_id, вместо того чтобы уронить весь постинг.
+    Camoufox включает geoip только если импортируется maxminddb — именно так
+    он сам выставляет свой внутренний флаг. Проверяем то же самое напрямую,
+    не завязываясь на путь к geoip_allowed: он менялся между версиями
+    (в 0.4.11 импорт из camoufox.geolocation падает с ModuleNotFoundError).
 
-    Чтобы включить нативный geoip на сервере:
-        python -m camoufox fetch
+    Базу качает `python -m camoufox fetch`.
     """
     global _GEOIP_OK
     if _GEOIP_OK is not None:
         return _GEOIP_OK
+
+    # Главный признак — импортируется ли maxminddb
     try:
-        from camoufox.geolocation import geoip_allowed
-        geoip_allowed()
-        _GEOIP_OK = True
-        logger.info("Camoufox native geoip: available")
+        import maxminddb  # noqa: F401
     except Exception as e:
         _GEOIP_OK = False
         logger.warning(
-            "Camoufox native geoip unavailable (%s). "
-            "Falling back to manual timezone. Run `python -m camoufox fetch` "
-            "on the server to enable coherent timezone/locale/WebRTC by proxy IP.",
+            "Camoufox geoip disabled: maxminddb not importable (%s). "
+            "Run: pip install maxminddb",
             type(e).__name__,
         )
+        return _GEOIP_OK
+
+    # Если есть официальная проверка — пробуем её, но отсутствие модуля
+    # отказом не считаем: путь зависит от версии Camoufox
+    for module_path in ("camoufox.geolocation", "camoufox.pkgman", "camoufox.utils"):
+        try:
+            mod = __import__(module_path, fromlist=["geoip_allowed"])
+            checker = getattr(mod, "geoip_allowed", None)
+            if checker:
+                checker()
+                break
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            continue
+        except Exception as e:
+            _GEOIP_OK = False
+            logger.warning("Camoufox geoip refused: %s", type(e).__name__)
+            return _GEOIP_OK
+
+    _GEOIP_OK = True
+    mmdb = _find_camoufox_mmdb()
+    logger.info(
+        "Camoufox native geoip: available%s",
+        f" (mmdb: {Path(mmdb).name})" if mmdb else "",
+    )
     return _GEOIP_OK
 
 
@@ -436,8 +488,32 @@ class ProfileManager:
         """
         profile_dir = self.profiles_dir / profile_id
         if profile_dir.exists():
-            logger.warning("Profile %s already exists, skipping creation", profile_id)
-            return self.get_profile_info(profile_id)
+            meta_ok = (profile_dir / META_FILE).exists()
+            fp_ok = (profile_dir / FINGERPRINT_FILE).exists()
+
+            if meta_ok and fp_ok:
+                logger.info("Profile %s already exists, reusing", profile_id)
+                return self.get_profile_info(profile_id)
+
+            # Папка есть, но файлов внутри не хватает — профиль недоделан.
+            # Так бывает, когда прошлый запуск упал на полпути. Раньше это
+            # навсегда убивало аккаунт: код видел папку, считал профиль
+            # готовым, не находил meta.json и падал — и так все три попытки.
+            logger.warning(
+                "Profile %s is incomplete (meta=%s, fingerprint=%s) — recreating",
+                profile_id, meta_ok, fp_ok,
+            )
+            try:
+                shutil.rmtree(profile_dir)
+            except Exception as e:
+                logger.error(
+                    "Cannot remove broken profile %s: %s. "
+                    "Close the browser or delete the folder manually.",
+                    profile_dir, e,
+                )
+                raise RuntimeError(
+                    f"Broken profile {profile_id} cannot be removed: {e}"
+                ) from e
 
         # Выбираем geometry
         if screen_geometry is None:
@@ -643,6 +719,11 @@ class ProfileManager:
             # page.evaluate() исполняется в изолированном мире:
             # наш dialog_gate/JS невидим для скриптов страницы.
             "main_world_eval": False,
+
+            # Camoufox предупреждает "Passing your own fingerprint is not
+            # recommended" — у нас это сделано намеренно, ради постоянства
+            # отпечатка аккаунта. Флаг просто убирает предупреждение.
+            "i_know_what_im_doing": True,
 
             # Camoufox по умолчанию доставляет uBlock Origin.
             # Он режет телеметрию Instagram — их клиентский JS шлёт беконы,

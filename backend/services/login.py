@@ -191,7 +191,7 @@ class InstagramLogin:
                 )
 
                 human = HumanInteractor(page, username)
-                logger.info("[%s] Profile launched, behavior=%s", username, human.profile.value)
+                logger.info("[%s] Profile launched, behavior=%s", username, human.profile.name)
 
                 # Автосборщик селекторов
                 from backend.services.selector_collector import SelectorCollector
@@ -414,6 +414,7 @@ class InstagramLogin:
         if error:
             error_text = await error.inner_text()
             logger.warning("[%s] Login error: %s", human.username, error_text.strip())
+            await self._diagnose_page(page, human, "login_error")
             return False
 
         # Проверяем 2FA по селектору (fallback)
@@ -422,7 +423,74 @@ class InstagramLogin:
             return await self._handle_2fa(page, human, account)
 
         logger.warning("[%s] No result detected (URL: %s)", human.username, current_url[:100])
+        await self._diagnose_page(page, human, "no_result")
         return False
+
+    async def _diagnose_page(self, page: Page, human: HumanInteractor, tag: str) -> None:
+        """
+        Снимает состояние страницы, когда результат непонятен.
+
+        Без этого отладка идёт вслепую: в логе «No result detected», а что
+        именно показал Instagram — неизвестно. Сохраняет скриншот и вытаскивает
+        текст возможных ошибок. Ищем по роли и положению в форме, а не по
+        английским словам — страница может быть на любом языке.
+        """
+        from pathlib import Path as _P
+        import time as _t
+
+        try:
+            shots = _P("logs") / "screenshots"
+            shots.mkdir(parents=True, exist_ok=True)
+            stamp = _t.strftime("%Y%m%d_%H%M%S")
+            shot = shots / f"{stamp}_{human.username}_{tag}.png"
+            await page.screenshot(path=str(shot), full_page=False)
+            logger.warning("[%s] Screenshot: %s", human.username, shot)
+        except Exception as e:
+            logger.debug("[%s] Screenshot failed: %s", human.username, e)
+
+        try:
+            info = await page.evaluate("""() => {
+                const vis = (el) => {
+                    const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+                    return r.width > 4 && r.height > 4 && s.display !== 'none' &&
+                           s.visibility !== 'hidden' && parseFloat(s.opacity || '1') > 0.05;
+                };
+                const clean = (t) => String(t || '').replace(/\\s+/g, ' ').trim();
+                const alerts = [...document.querySelectorAll(
+                    '[role="alert"],[aria-live],#slfErrorAlert,' +
+                    '[data-testid*="error"],[id*="error" i],[class*="error" i]'
+                )].filter(vis).map(e => clean(e.innerText)).filter(t => t.length > 2);
+                const form = document.querySelector('form');
+                const formText = form ? clean(form.innerText).slice(0, 400) : '';
+                const inputs = [...document.querySelectorAll('input')].map(i => ({
+                    name: i.name || i.type,
+                    filled: !!i.value,
+                    len: (i.value || '').length,
+                }));
+                return {
+                    alerts: [...new Set(alerts)].slice(0, 5),
+                    formText, inputs,
+                    title: clean(document.title),
+                    lang: document.documentElement.lang || '',
+                    bodyStart: clean(document.body ? document.body.innerText : '').slice(0, 300),
+                };
+            }""")
+
+            logger.warning("[%s] -- ДИАГНОСТИКА СТРАНИЦЫ --", human.username)
+            logger.warning("[%s]   title : %s", human.username, str(info.get("title", ""))[:90])
+            logger.warning("[%s]   lang  : %s", human.username, info.get("lang", ""))
+            for a in info.get("alerts", []):
+                logger.warning("[%s]   ALERT : %s", human.username, str(a)[:180])
+            for i in info.get("inputs", []):
+                logger.warning(
+                    "[%s]   input : %s filled=%s len=%s",
+                    human.username, i.get("name"), i.get("filled"), i.get("len"),
+                )
+            if info.get("formText"):
+                logger.warning("[%s]   form  : %s", human.username, str(info["formText"])[:250])
+            logger.warning("[%s]   body  : %s", human.username, str(info.get("bodyStart", ""))[:250])
+        except Exception as e:
+            logger.debug("[%s] Page diagnostics failed: %s", human.username, e)
 
     async def _handle_2fa(
         self,
@@ -709,6 +777,8 @@ class LoginOrchestrator:
         - MAX_LOGIN_ATTEMPTS неудач → аккаунт невалидный
         """
         last_result = LoginResult(success=False, username=account["username"])
+        # Отличаем отказ Instagram от падения нашего кода
+        rejected_by_instagram = False
         consecutive_failures = 0
 
         for attempt in range(1, MAX_LOGIN_ATTEMPTS + 1):
@@ -800,22 +870,42 @@ class LoginOrchestrator:
             # Закрываем профиль перед следующей попыткой
             await self.pm.close_profile(account["username"])
 
+            # Запоминаем, отклонял ли аккаунт сам Instagram
+            if is_proxy_fault:
+                rejected_by_instagram = True
+
             # Пауза между попытками
             if attempt < MAX_LOGIN_ATTEMPTS:
                 pause = 5.0 + attempt * 3.0
                 await asyncio.sleep(pause)
 
-        # Все попытки исчерпаны → аккаунт невалидный (dead)
-        await self._update_status(
-            account["id"],
-            AccountStatus.DEAD.value,
-            f"Failed {MAX_LOGIN_ATTEMPTS} attempts — likely invalid credentials",
-        )
-        logger.error(
-            "[%s] All %d login attempts failed — marked dead",
-            account["username"], MAX_LOGIN_ATTEMPTS,
-        )
-        last_result.status = AccountStatus.DEAD
+        # Попытки исчерпаны. «Мёртвый» ставим только если аккаунт
+        # действительно отверг Instagram. Если все три раза падал наш
+        # собственный код — аккаунт ни при чём, возвращаем в 'new'.
+        if rejected_by_instagram:
+            await self._update_status(
+                account["id"],
+                AccountStatus.DEAD.value,
+                f"Failed {MAX_LOGIN_ATTEMPTS} attempts — invalid credentials",
+            )
+            logger.error(
+                "[%s] All %d attempts rejected by Instagram — marked dead",
+                account["username"], MAX_LOGIN_ATTEMPTS,
+            )
+            last_result.status = AccountStatus.DEAD
+        else:
+            await self._update_status(
+                account["id"],
+                AccountStatus.NEW.value,
+                f"Internal errors on {MAX_LOGIN_ATTEMPTS} attempts — retry later",
+            )
+            logger.error(
+                "[%s] All %d attempts failed with INTERNAL errors — "
+                "account left as 'new', not dead. Last: %s",
+                account["username"], MAX_LOGIN_ATTEMPTS, last_result.message,
+            )
+            last_result.status = AccountStatus.NEW
+
         return last_result
 
 
