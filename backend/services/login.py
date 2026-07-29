@@ -481,10 +481,10 @@ class InstagramLogin:
     async def _handle_post_login_popups(self, page: Page, human: HumanInteractor) -> None:
         """Прокликивает попапы: Save Info, Notifications."""
 
-        # Save Login Info → "Not Now"
+        # Save Login Info → "Save info" (сохраняем куки для следующего логина)
         await self._dismiss_popup(
             page, human,
-            Selectors.SAVE_INFO_NOT_NOW,
+            Selectors.SAVE_INFO_BUTTON,
             "Save Login Info",
         )
 
@@ -976,6 +976,12 @@ async def db_bind_proxy_to_account(account_id: int, proxy_id: int) -> None:
         execute,
         "UPDATE static_proxies SET account_id = ?, status = 'bound' WHERE id = ?",
         (account_id, proxy_id),
+    )
+    # Снимаем этот прокси с других аккаунтов (UNIQUE constraint)
+    await run_sync(
+        execute,
+        "UPDATE accounts SET static_proxy_id = NULL WHERE static_proxy_id = ? AND id != ?",
+        (proxy_id, account_id),
     )
     await run_sync(
         execute,
