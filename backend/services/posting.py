@@ -379,7 +379,7 @@ class ReelPoster:
 
             if category == "operation_processing":
                 # Ещё грузится — ждём
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(random.uniform(0.8, 1.5))
                 continue
 
             if category == "policy_notice":
@@ -407,7 +407,7 @@ class ReelPoster:
                 except Exception:
                     pass
 
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(random.uniform(0.8, 1.5))
 
         # Timeout — последняя проверка
         url = self.page.url

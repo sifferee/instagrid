@@ -424,16 +424,25 @@ class StoryPublisher:
         """
         headers = build_headers(session)
 
-        # Прокси для httpx
+        # Прокси для httpx (поддержка HTTP/HTTPS/SOCKS5)
         proxy_url = None
         if self.proxy:
             user = self.proxy.get("username", "")
             pwd = self.proxy.get("password", "")
             server = self.proxy["server"]
-            if user and pwd:
-                proxy_url = f"http://{user}:{pwd}@{server}"
+            # Если server уже содержит схему (socks5://host:port) — используем как есть
+            if any(server.startswith(s) for s in ("http://", "https://", "socks5://")):
+                if user and pwd:
+                    # Вставляем credentials в URL: socks5://user:pass@host:port
+                    scheme_end = server.index("://") + 3
+                    proxy_url = f"{server[:scheme_end]}{user}:{pwd}@{server[scheme_end:]}"
+                else:
+                    proxy_url = server
             else:
-                proxy_url = f"http://{server}"
+                if user and pwd:
+                    proxy_url = f"http://{user}:{pwd}@{server}"
+                else:
+                    proxy_url = f"http://{server}"
 
         async with httpx.AsyncClient(
             timeout=60,

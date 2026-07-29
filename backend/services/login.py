@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -371,7 +372,7 @@ class InstagramLogin:
 
         # Ждём пока URL изменится (redirect после логина)
         for _ in range(30):  # макс 30 сек
-            await asyncio.sleep(1)
+            await asyncio.sleep(random.uniform(0.8, 1.4))
             current_url = page.url
             if current_url != login_url:
                 break
@@ -467,7 +468,7 @@ class InstagramLogin:
 
         # Ждём redirect после 2FA
         for _ in range(20):
-            await asyncio.sleep(1)
+            await asyncio.sleep(random.uniform(0.8, 1.4))
             current_url = page.url
             # Успех — ушли со страницы 2FA
             if "two_step" not in current_url and "two_factor" not in current_url and "challenge" not in current_url:
@@ -960,6 +961,7 @@ async def db_get_next_proxy(pool_id: int) -> dict[str, str] | None:
     """
     Атомарно берёт следующий свободный статический прокси из пула.
     Fix #2: BEGIN IMMEDIATE + UPDATE...RETURNING в одном запросе.
+    Поддержка HTTP/HTTPS/SOCKS5 через поле protocol.
     """
     row = await run_sync(
         execute_atomic,
@@ -970,15 +972,18 @@ async def db_get_next_proxy(pool_id: int) -> dict[str, str] | None:
                WHERE pool_id = ? AND status = 'available' AND account_id IS NULL
                ORDER BY id ASC LIMIT 1
            )
-           RETURNING id, host, port, username, password""",
+           RETURNING id, host, port, username, password, protocol""",
         (pool_id,),
     )
     if not row:
         return None
 
+    protocol = row.get("protocol", "http") or "http"
+    server = f"{protocol}://{row['host']}:{row['port']}"
+
     return {
         "id": row["id"],
-        "server": f"{row['host']}:{row['port']}",
+        "server": server,
         "username": row["username"] or "",
         "password": row["password"] or "",
     }

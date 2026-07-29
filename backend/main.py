@@ -1,4 +1,5 @@
 """InstaGrid — FastAPI приложение."""
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,8 +26,19 @@ async def lifespan(app: FastAPI):
     init_content_tables()
     init_stories_tables()
     init_checker_tables()
+
+    # Story auto-trigger background task
+    from backend.services.profile_manager import ProfileManager
+    from backend.services.story_trigger import StoryTriggerWorker
+    pm = ProfileManager()
+    story_worker = StoryTriggerWorker(pm)
+    await story_worker.start()
+    app.state.story_worker = story_worker
+
     yield
+
     # ── Shutdown ──
+    await story_worker.stop()
 
 
 app = FastAPI(title="InstaGrid", version="0.3.0", lifespan=lifespan)

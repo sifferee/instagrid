@@ -332,11 +332,12 @@ class ProfileManager:
             proxy_host = proxy["server"].split(":")[0]
             timezone_id = self.geoip.get_timezone(proxy_host)
 
-        # Формируем Camoufox proxy config
+        # Формируем Camoufox proxy config (поддержка HTTP/HTTPS/SOCKS5)
         camoufox_proxy = None
         if proxy:
             server = proxy["server"]
-            if not server.startswith("http"):
+            # Определяем протокол — если уже есть схема, оставляем как есть
+            if not any(server.startswith(s) for s in ("http://", "https://", "socks5://")):
                 server = f"http://{server}"
             camoufox_proxy = {
                 "server": server,

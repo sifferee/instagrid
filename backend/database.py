@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS static_proxies (
     port        INTEGER NOT NULL,
     username    TEXT,
     password    TEXT,
+    protocol    TEXT    NOT NULL DEFAULT 'http'
+                        CHECK (protocol IN ('http', 'https', 'socks5')),
     account_id  INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
     status      TEXT    NOT NULL DEFAULT 'available'
                         CHECK (status IN ('available', 'bound')),
@@ -127,10 +129,18 @@ def _get_conn() -> sqlite3.Connection:
 
 
 def init_db():
-    """Создать все таблицы если не существуют."""
+    """Создать все таблицы если не существуют + миграции."""
     conn = _get_conn()
     conn.executescript(SCHEMA)
     conn.commit()
+    # Миграция: добавить protocol если нет (для существующих БД)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(static_proxies)")}
+        if "protocol" not in cols:
+            conn.execute("ALTER TABLE static_proxies ADD COLUMN protocol TEXT NOT NULL DEFAULT 'http'")
+            conn.commit()
+    except Exception:
+        pass
 
 
 @contextmanager
