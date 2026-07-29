@@ -467,15 +467,35 @@ class HumanInteractor:
         return await self.type_text(text)
 
     async def clear_and_type(self, selector: str, text: str) -> bool:
-        """Очищает поле (Ctrl+A → Backspace) и вводит текст."""
+        """
+        Кликает по полю и вводит текст.
+
+        Ctrl+A → Backspace выполняется ТОЛЬКО если в поле что-то есть.
+        На пустом поле логина человек просто кликает и печатает; select-all
+        по пустому input — искусственная последовательность клавиш, а формы
+        логина как раз и слушают keydown/keyup.
+        """
         ok = await self.click_selector(selector)
         if not ok:
             return False
         await self._sleep(0.08, 0.2)
-        await self.page.keyboard.press("Control+a")
-        await self._sleep(0.05, 0.15)
-        await self.page.keyboard.press("Backspace")
-        await self._sleep(0.1, 0.3)
+
+        existing = ""
+        try:
+            el = await self.page.query_selector(selector)
+            if el:
+                existing = await el.input_value()
+        except Exception:
+            existing = ""
+
+        if existing:
+            await self.page.keyboard.press("Control+a")
+            await self._sleep(0.05, 0.15)
+            await self.page.keyboard.press("Backspace")
+            await self._sleep(0.1, 0.3)
+        else:
+            await self._sleep(0.12, 0.35)
+
         return await self.type_text(text)
 
     # ── Скролл ───────────────────────────────────────────────────────────

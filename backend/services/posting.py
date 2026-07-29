@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 import random
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from backend.services.human import HumanInteractor
 from backend.services.profile_manager import ProfileManager
 from backend.services.content_manager import ContentManager
 from backend.services.mobile_proxy import MobileProxyRotator
+from backend.services.scheduler import is_within_active_window, next_session_at
 from backend.services.dialog_gate import (
     inspect_dialog, continue_after_dialog,
     NO_BLOCKER, HANDLED_REEVALUATE, TERMINAL_MANUAL,
@@ -80,6 +82,12 @@ class PostSelectors:
     # Диалог загрузки
     FILE_INPUT = 'input[type="file"][accept*="video"]'
     FILE_INPUT_FALLBACK = 'input[type="file"]'
+    # Настоящая кнопка выбора файла — кликаем её, а не дёргаем скрытый input
+    SELECT_FROM_COMPUTER = (
+        '//button[contains(text(), "Select from computer")] | '
+        '//div[@role="button"][contains(text(), "Select from computer")] | '
+        '//button[contains(text(), "Select From Computer")]'
+    )
 
     # Шаги создания рилса
     NEXT_BUTTON = '//button[contains(text(), "Next")]'
@@ -270,30 +278,22 @@ class ReelPoster:
             await self.human.click_selector(PostSelectors.CREATE_BUTTON)
             await self.human.random_pause(1.0, 2.0)
 
-            # 2. Загружаем видеофайл через скрытый input
-            file_input = await self.page.query_selector(PostSelectors.FILE_INPUT)
-            if not file_input:
-                file_input = await self.page.query_selector(PostSelectors.FILE_INPUT_FALLBACK)
-            if not file_input:
-                # Иногда нужно сначала выбрать "Reel" из меню
-                reel_option = await self.page.query_selector(PostSelectors.CREATE_MENU_REEL)
-                if reel_option:
-                    await self.human.click_element(reel_option)
-                    await self.human.random_pause(1.0, 2.0)
-                file_input = await self.page.wait_for_selector(
-                    f"{PostSelectors.FILE_INPUT}, {PostSelectors.FILE_INPUT_FALLBACK}",
-                    timeout=ELEMENT_WAIT_TIMEOUT,
-                )
+            # Иногда нужно сначала выбрать "Reel" из меню
+            reel_option = await self.page.query_selector(PostSelectors.CREATE_MENU_REEL)
+            if reel_option:
+                await self.human.click_element(reel_option)
+                await self.human.random_pause(1.0, 2.0)
 
-            if not file_input:
-                logger.error("[%s] File input not found", username)
+            # 2. Загружаем видео
+            if not await self._attach_video(video_path):
+                logger.error("[%s] Could not attach video", username)
                 return False
 
-            await file_input.set_input_files(video_path)
-            logger.info("[%s] Video file uploaded to form", username)
-
-            # 3. Ждём обработку + нажимаем Next
-            await self.human.random_pause(3.0, 6.0)
+            # 3. Ждём обработку. Курсор при этом не должен стоять колом —
+            # живой человек за 3-6 секунд шевелит мышью.
+            await self.human.random_pause(1.0, 2.0)
+            await self.human.wander(moves=random.randint(1, 2))
+            await self.human.random_pause(1.5, 3.5)
             await self._click_next_buttons()
 
             # 4. Вводим описание
@@ -318,6 +318,57 @@ class ReelPoster:
         except Exception as e:
             logger.exception("[%s] Error posting reel", username)
             return False
+
+    async def _attach_video(self, video_path: str) -> bool:
+        """
+        Прикрепляет видео к форме.
+
+        Основной путь: реальный клик по «Select from computer» с перехватом
+        file chooser. Тогда последовательность событий такая же, как у человека:
+        pointerdown/pointerup/click по кнопке → открытие диалога → change на input.
+
+        set_input_files по скрытому input даёт change вообще без клика и без
+        user gesture — Instagram это видит. Оставлен только как запасной вариант,
+        если кнопку не нашли.
+        """
+        username = self.human.username
+
+        # ── Путь 1: клик по кнопке + перехват file chooser ──
+        try:
+            btn = await self.page.wait_for_selector(
+                PostSelectors.SELECT_FROM_COMPUTER, timeout=6000,
+            )
+            if btn:
+                async with self.page.expect_file_chooser(timeout=15_000) as fc_info:
+                    await self.human.click_element(btn)
+                chooser = await fc_info.value
+                await chooser.set_files(video_path)
+                logger.info("[%s] Video attached via file chooser", username)
+                return True
+        except PwTimeout:
+            logger.debug("[%s] Select-from-computer button not found", username)
+        except Exception as e:
+            logger.debug("[%s] File chooser path failed: %s", username, e)
+
+        # ── Путь 2 (fallback): скрытый input ──
+        try:
+            file_input = await self.page.query_selector(PostSelectors.FILE_INPUT)
+            if not file_input:
+                file_input = await self.page.wait_for_selector(
+                    f"{PostSelectors.FILE_INPUT}, {PostSelectors.FILE_INPUT_FALLBACK}",
+                    timeout=ELEMENT_WAIT_TIMEOUT,
+                )
+            if file_input:
+                await file_input.set_input_files(video_path)
+                logger.warning(
+                    "[%s] Video attached via hidden input (fallback — less natural)",
+                    username,
+                )
+                return True
+        except Exception as e:
+            logger.error("[%s] Video attach failed: %s", username, e)
+
+        return False
 
     async def _click_next_buttons(self) -> None:
         """Прокликивает кнопки Next в визарде создания."""
@@ -648,8 +699,9 @@ class PostingController:
 
             if not accounts:
                 if loop_forever:
-                    logger.info("No ready accounts, sleeping 30 min...")
-                    await self._interruptible_sleep(1800)
+                    # Опрос чаще, чем раньше: аккаунты созревают по своему
+                    # личному расписанию в разное время суток.
+                    await self._interruptible_sleep(random.uniform(600, 1200))
                     continue
                 else:
                     break
@@ -673,10 +725,12 @@ class PostingController:
             if not loop_forever:
                 break
 
-            # Пауза между сессиями
-            pause = random.uniform(PAUSE_BETWEEN_SESSIONS_MIN, PAUSE_BETWEEN_SESSIONS_MAX)
-            logger.info("Session complete. Next in %.1f hours", pause / 3600)
-            await self._interruptible_sleep(pause)
+            # Короткий опрос вместо общей паузы 10-14ч.
+            # Раньше весь батч засыпал разом и просыпался разом — все аккаунты
+            # оказывались активны в одном окне. Теперь у каждого аккаунта
+            # свой cooldown_until из scheduler.py, а цикл просто проверяет,
+            # кто уже созрел.
+            await self._interruptible_sleep(random.uniform(900, 1500))
 
         return self._results
 
@@ -733,6 +787,13 @@ class PostingController:
             logger.info("[Worker %d] Starting %s", worker_id, username)
 
             result = await self._post_for_account(account, reels_count)
+
+            # Персональное время следующей сессии. Именно это разводит
+            # аккаунты по суткам вместо общей паузы на весь батч.
+            try:
+                await self._set_next_session(account)
+            except Exception as e:
+                logger.warning("[%s] Could not set next session: %s", username, e)
 
             async with self._results_lock:
                 self._results.append(result)
@@ -894,20 +955,81 @@ class PostingController:
         rest_min = REST_AFTER_LOGIN_MIN
         ready = []
         for acc in accounts:
+            username = acc["username"]
+
+            # 1. Отлёжка после логина
             login_at = acc.get("last_login_at")
-            if not login_at:
-                ready.append(acc)  # никогда не логинился через нас — допускаем
-                continue
-            if now - login_at >= rest_min:
-                ready.append(acc)
-            else:
-                remaining = rest_min - (now - login_at)
+            if login_at and now - login_at < rest_min:
                 logger.debug(
                     "[%s] Still resting, %.1fh remaining",
-                    acc["username"], remaining / 3600,
+                    username, (rest_min - (now - login_at)) / 3600,
                 )
+                continue
 
+            # 2. Персональный cooldown — у каждого аккаунта свой,
+            #    а не общий на весь батч
+            cooldown_until = acc.get("cooldown_until")
+            if cooldown_until and now < cooldown_until:
+                logger.debug(
+                    "[%s] Personal cooldown, %.1fh remaining",
+                    username, (cooldown_until - now) / 3600,
+                )
+                continue
+
+            # 3. Окно активности в таймзоне аккаунта.
+            #    Без этого аккаунт с нью-йоркским прокси постит в 4 утра.
+            tz = await self._account_timezone(acc)
+            if not is_within_active_window(username, tz):
+                logger.debug("[%s] Outside active window (tz=%s)", username, tz)
+                continue
+
+            ready.append(acc)
+
+        # Порядок внутри батча — случайный. Стабильный ORDER BY id означает,
+        # что аккаунты month after month ходят к Instagram в одной и той же
+        # последовательности.
+        random.shuffle(ready)
         return ready
+
+    async def _account_timezone(self, acc: dict) -> str:
+        """Таймзона аккаунта по IP его статического прокси."""
+        cached = acc.get("_tz")
+        if cached:
+            return cached
+
+        tz = "America/New_York"
+        proxy_id = acc.get("static_proxy_id")
+        if proxy_id:
+            row = await _run_sync(
+                query_one, "SELECT host FROM static_proxies WHERE id = ?", (proxy_id,),
+            )
+            if row and row.get("host"):
+                try:
+                    tz = self.pm.geoip.get_timezone(row["host"])
+                except Exception:
+                    pass
+        acc["_tz"] = tz
+        return tz
+
+    async def _set_next_session(self, acc: dict) -> None:
+        """
+        Ставит аккаунту персональное время следующей сессии.
+        Вызывается после того, как аккаунт отработал.
+        """
+        username = acc["username"]
+        tz = await self._account_timezone(acc)
+        nxt = next_session_at(username, tz, last_session=time.time())
+        await _run_sync(
+            execute,
+            "UPDATE accounts SET cooldown_until = ?, updated_at = unixepoch('now') WHERE id = ?",
+            (nxt, acc["id"]),
+        )
+        logger.info(
+            "[%s] Next session at %s (tz=%s)",
+            username,
+            datetime.fromtimestamp(nxt).strftime("%Y-%m-%d %H:%M"),
+            tz,
+        )
 
     async def _interruptible_sleep(self, seconds: float) -> None:
         """Сон с возможностью прерывания через stop()."""

@@ -182,7 +182,10 @@ class StoryTriggerWorker:
                 context, page = await self.pm.launch_profile(
                     profile_id=username,
                     proxy=proxy,
-                    headless=True,  # сторис через API, UI не нужен
+                    # headless=False — тот же режим, что при логине и постинге.
+                    # Headless меняет растеризацию шрифтов и AA в canvas/WebGL:
+                    # один аккаунт то headed, то headless = скачущий fingerprint.
+                    headless=False,
                 )
 
                 try:

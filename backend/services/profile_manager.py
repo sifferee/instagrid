@@ -24,8 +24,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from browserforge.fingerprints import FingerprintGenerator, Screen
+from browserforge.fingerprints import (
+    FingerprintGenerator, Screen, Fingerprint,
+    ScreenFingerprint, NavigatorFingerprint, VideoCard,
+)
 from camoufox import AsyncNewBrowser
+from camoufox.addons import DefaultAddons
 from playwright.async_api import BrowserContext, Page
 
 from backend.config import PROFILES_DIR as _CONFIG_PROFILES_DIR
@@ -51,8 +55,51 @@ class _Namespace:
 
 
 def _dict_to_namespace(d: dict) -> _Namespace:
-    """Конвертирует dict в объект с атрибутами для Camoufox."""
+    """Конвертирует dict в объект с атрибутами (legacy, не для Camoufox)."""
     return _Namespace(d)
+
+
+def _build_dataclass(cls, data: dict):
+    """Собирает dataclass из dict, подставляя None для отсутствующих полей."""
+    import dataclasses
+    if not isinstance(data, dict):
+        return None
+    kwargs = {}
+    for f in dataclasses.fields(cls):
+        kwargs[f.name] = data.get(f.name)
+    return cls(**kwargs)
+
+
+def fingerprint_from_dict(d: dict) -> Fingerprint:
+    """
+    Реконструирует настоящий browserforge.Fingerprint из сохранённого JSON.
+
+    КРИТИЧНО: без этого Camoufox генерирует НОВЫЙ случайный fingerprint
+    при каждом запуске. Тот же аккаунт → разный Canvas/WebGL/шрифты/UA
+    каждую сессию = мгновенный флаг для Instagram.
+    """
+    screen = _build_dataclass(ScreenFingerprint, d.get("screen") or {})
+    navigator = _build_dataclass(NavigatorFingerprint, d.get("navigator") or {})
+
+    video_card = None
+    vc = d.get("videoCard")
+    if isinstance(vc, dict):
+        video_card = _build_dataclass(VideoCard, vc)
+
+    return Fingerprint(
+        screen=screen,
+        navigator=navigator,
+        headers=d.get("headers") or {},
+        videoCodecs=d.get("videoCodecs") or {},
+        audioCodecs=d.get("audioCodecs") or {},
+        pluginsData=d.get("pluginsData") or {},
+        battery=d.get("battery"),
+        videoCard=video_card,
+        multimediaDevices=d.get("multimediaDevices") or [],
+        fonts=d.get("fonts") or [],
+        mockWebRTC=d.get("mockWebRTC"),
+        slim=d.get("slim"),
+    )
 
 # ─── Константы ────────────────────────────────────────────────────────────────
 
@@ -224,7 +271,17 @@ def generate_fingerprint(
         os=os_platform.value,
     )
 
-    fingerprint = fg.generate()
+    # Ограничиваем экран выбранным пресетом, чтобы screen в fingerprint
+    # совпадал с geometry профиля. Иначе BrowserForge выдаст свой размер,
+    # и метаданные профиля разойдутся с тем, что реально видит сайт.
+    fingerprint = fg.generate(
+        screen=Screen(
+            min_width=screen_geometry.screen_width,
+            max_width=screen_geometry.screen_width,
+            min_height=screen_geometry.screen_height,
+            max_height=screen_geometry.screen_height,
+        ),
+    )
 
     # BrowserForge возвращает Fingerprint-объект, конвертируем в dict для JSON
     def _to_dict(obj):
@@ -328,6 +385,8 @@ class ProfileManager:
         self.geoip = GeoIPResolver(geoip_db_path)
         # Активные контексты: profile_id → BrowserContext
         self._active_contexts: dict[str, BrowserContext] = {}
+        # Один playwright на процесс (см. _get_playwright)
+        self._playwright = None
 
     # ── Создание профиля ──────────────────────────────────────────────────
 
@@ -401,10 +460,19 @@ class ProfileManager:
         if not profile_dir.exists():
             raise FileNotFoundError(f"Profile {profile_id} not found")
 
-        # Загружаем fingerprint и конвертируем dict → объект с атрибутами (Camoufox требует .navigator и т.д.)
+        # Загружаем СОХРАНЁННЫЙ fingerprint и реконструируем настоящий
+        # browserforge.Fingerprint — Camoufox примет только его.
         fp_path = profile_dir / FINGERPRINT_FILE
         fp_dict = json.loads(fp_path.read_text(encoding="utf-8"))
-        fingerprint = _dict_to_namespace(fp_dict)
+        try:
+            fingerprint = fingerprint_from_dict(fp_dict)
+        except Exception as e:
+            logger.error(
+                "Profile %s: cannot rebuild fingerprint (%s). "
+                "Camoufox would generate a RANDOM one — aborting to avoid identity drift.",
+                profile_id, e,
+            )
+            raise RuntimeError(f"Corrupt fingerprint for {profile_id}: {e}") from e
 
         # Загружаем мету для geometry
         meta_path = profile_dir / META_FILE
@@ -450,28 +518,13 @@ class ProfileManager:
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
 
-                # Инжектим реалистичные outer/screen метрики (SparkGrid паттерн)
-                # viewport задаётся через Camoufox, но outerWidth/outerHeight/screenX/screenY
-                # и screen.width/height нужно выставить вручную через JS
-                geometry_js = f"""() => {{
-                    Object.defineProperty(window, 'outerWidth', {{value: {geom.outer_width}, configurable: true}});
-                    Object.defineProperty(window, 'outerHeight', {{value: {geom.outer_height}, configurable: true}});
-                    Object.defineProperty(window, 'screenX', {{value: {geom.position_x}, configurable: true}});
-                    Object.defineProperty(window, 'screenY', {{value: {geom.position_y}, configurable: true}});
-                    Object.defineProperty(window, 'screenLeft', {{value: {geom.position_x}, configurable: true}});
-                    Object.defineProperty(window, 'screenTop', {{value: {geom.position_y}, configurable: true}});
-                    if (window.screen) {{
-                        Object.defineProperty(screen, 'width', {{value: {geom.screen_width}, configurable: true}});
-                        Object.defineProperty(screen, 'height', {{value: {geom.screen_height}, configurable: true}});
-                        Object.defineProperty(screen, 'availWidth', {{value: {geom.avail_width}, configurable: true}});
-                        Object.defineProperty(screen, 'availHeight', {{value: {geom.avail_height}, configurable: true}});
-                    }}
-                }}"""
-                try:
-                    await context.add_init_script(script=geometry_js)
-                    await page.evaluate(geometry_js)
-                except Exception as ge:
-                    logger.debug("Geometry injection note: %s", ge)
+                # ВАЖНО: никакого JS-инжекта геометрии.
+                # Object.defineProperty(window,'outerWidth',{value:...}) заменяет
+                # нативный accessor на data-property — это ловится одной строкой:
+                #   Object.getOwnPropertyDescriptor(window,'outerWidth').get === undefined
+                # У настоящего Firefox там getter. Всю геометрию (screen/outer/inner/
+                # availWidth/screenX) Camoufox проставляет сам на уровне движка
+                # из переданного fingerprint — нативно и неотличимо.
 
                 self._active_contexts[profile_id] = context
 
@@ -499,10 +552,23 @@ class ProfileManager:
             f"Failed to launch profile {profile_id} after {MAX_PROXY_RETRIES} attempts: {last_error}"
         )
 
+    async def _get_playwright(self):
+        """
+        Один общий playwright-инстанс на весь процесс.
+
+        Было: async_playwright().start() на КАЖДЫЙ запуск профиля, без .stop().
+        Каждый вызов поднимает отдельный node-драйвер; ссылка перетиралась,
+        старые процессы висели навсегда. На сотнях аккаунтов сервер съедало.
+        """
+        if self._playwright is None:
+            from playwright.async_api import async_playwright
+            self._playwright = await async_playwright().start()
+        return self._playwright
+
     async def _do_launch(
         self,
         profile_dir: Path,
-        fingerprint: dict,
+        fingerprint: Fingerprint,
         proxy: dict | None,
         timezone_id: str,
         screen_w: int,
@@ -510,40 +576,72 @@ class ProfileManager:
         headless: bool,
     ) -> BrowserContext:
         """Внутренний запуск Camoufox с persistent_context."""
-        from playwright.async_api import async_playwright
-
-        # user_data_dir — куки/кеш сохраняются между сессиями
         user_data_dir = str(profile_dir / "browser_data")
 
         launch_kwargs: dict[str, Any] = {
             "headless": headless,
             "persistent_context": True,
             "user_data_dir": user_data_dir,
-            # Camoufox сам генерирует fingerprint через BrowserForge
-            # Передаём только os для правильной генерации
-            "os": "windows",
-            # WebRTC всегда заблокирован
-            "block_webrtc": True,
-            # Язык всегда en-US
-            "locale": DEFAULT_LOCALE,
-            # Viewport = geometry пресет
-            "viewport": {"width": screen_w, "height": screen_h},
-            # Timezone по GeoIP
-            "timezone_id": timezone_id,
-            # Geolocation выключена
-            "geolocation": None,
-            "permissions": [],
+
+            # ── ГЛАВНОЕ: постоянный fingerprint аккаунта ──
+            # Без этого Camoufox генерирует новый случайный при каждом старте.
+            # Отсюда же берутся screen/outer/inner/availWidth/screenX —
+            # нативно, без JS-подмены.
+            "fingerprint": fingerprint,
+
+            # ── GeoIP: timezone/locale/geolocation/WebRTC по IP прокси ──
+            # Camoufox сам определяет exit-IP через прокси и делает
+            # согласованными timezone, язык, координаты и WebRTC-адрес.
+            # Ручной timezone_id этого не даёт: Intl, Date.getTimezoneOffset
+            # и геолокация расходятся между собой.
+            "geoip": True,
+
+            # WebRTC НЕ блокируем: у настоящего Firefox он есть, полное
+            # отсутствие само по себе аномалия. При geoip=True Camoufox
+            # подставляет в WebRTC IP прокси — утечки реального IP нет,
+            # а стек выглядит живым.
+            "block_webrtc": False,
+
+            # Тёплый HTTP-кеш между сессиями. Без него постоянный профиль
+            # каждый раз тянет всё заново и никогда не шлёт
+            # If-None-Match/If-Modified-Since — для возвращающегося
+            # пользователя это неестественно.
+            "enable_cache": True,
+
+            # page.evaluate() исполняется в изолированном мире:
+            # наш dialog_gate/JS невидим для скриптов страницы.
+            "main_world_eval": False,
+
+            # Camoufox по умолчанию доставляет uBlock Origin.
+            # Он режет телеметрию Instagram — их клиентский JS шлёт беконы,
+            # которые просто не уходят. Отсутствие ожидаемых запросов
+            # заметнее, чем сами запросы. Плюс наличие расширения
+            # детектится по инжектируемым стилям.
+            "exclude_addons": [DefaultAddons.UBO],
         }
 
         if proxy:
             launch_kwargs["proxy"] = proxy
+        else:
+            # Без прокси geoip=True полезет за реальным IP сервера
+            launch_kwargs["geoip"] = False
+            launch_kwargs["locale"] = DEFAULT_LOCALE
+            launch_kwargs["timezone_id"] = timezone_id
 
-        # Camoufox AsyncNewBrowser требует playwright instance
-        pw = await async_playwright().start()
-        self._playwright = pw  # сохраняем чтобы закрыть потом
+        pw = await self._get_playwright()
         context = await AsyncNewBrowser(pw, **launch_kwargs)
 
         return context
+
+    async def shutdown(self) -> None:
+        """Закрывает все профили и общий playwright-инстанс."""
+        await self.close_all()
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception as e:
+                logger.warning("Playwright stop error: %s", e)
+            self._playwright = None
 
     # ── Закрытие профиля ──────────────────────────────────────────────────
 

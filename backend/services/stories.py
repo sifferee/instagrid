@@ -447,7 +447,9 @@ class StoryPublisher:
         async with httpx.AsyncClient(
             timeout=60,
             proxy=proxy_url,
-            verify=False,
+            # verify=True: без проверки TLS провайдер прокси может
+            # подменить сертификат и снять sessionid.
+            verify=True,
         ) as client:
 
             # ── Шаг 1: Upload ─────────────────────────────────────────────
@@ -697,7 +699,9 @@ class StoryController:
     """
 
     def __init__(self) -> None:
-        self.publisher = StoryPublisher()
+        # StoryPublisher (httpx) больше не используется — публикация идёт
+        # через BrowserStoryPublisher внутри браузера. Класс оставлен
+        # в файле только для отладки вручную.
         self.photo_pool = StoryPhotoPool()
         self.auto_trigger = StoryAutoTrigger()
 
@@ -721,23 +725,24 @@ class StoryController:
         Returns:
             {"success": bool, "media_id": str, "error": str}
         """
-        # Извлекаем сессию из BrowserContext
+        # Проверяем что сессия жива (куки на месте)
         session = await extract_session(context, page)
-
         if not session["csrftoken"] or not session["sessionid"]:
             return {"success": False, "media_id": "", "error": "Missing session cookies"}
 
         # Подготавливаем изображение
         image_bytes, upload_id = prepare_story_image(image_path, link_url, cta_text)
 
-        # Публикуем
-        publisher = StoryPublisher(proxy=proxy)
+        # Публикуем ИЗНУТРИ браузера: настоящий TLS/HTTP2 Firefox, свои куки,
+        # тот же прокси и соединение. httpx давал чужой JA3 при firefox'овом UA.
+        from backend.services.story_publisher_browser import BrowserStoryPublisher
+        publisher = BrowserStoryPublisher(page)
         result = await publisher.publish(
-            session=session,
             image_bytes=image_bytes,
             upload_id=upload_id,
             link_url=link_url,
             sticker_text=cta_text,
+            sticker_position=randomize_sticker_position() if link_url else None,
         )
 
         # Сохраняем в БД

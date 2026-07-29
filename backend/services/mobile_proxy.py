@@ -223,7 +223,9 @@ class MobileProxyRotator:
             async with httpx.AsyncClient(
                 timeout=IP_CHECK_TIMEOUT,
                 proxy=proxy_url,
-                verify=False,
+                # verify=True: без проверки TLS провайдер прокси может
+                # подменить сертификат и снять sessionid.
+                verify=True,
             ) as client:
                 resp = await client.get(IP_CHECK_URL)
                 if resp.status_code == 200:

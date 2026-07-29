@@ -290,12 +290,20 @@ class InstagramLogin:
                     raise RuntimeError("Instagram login page not loading after retries")
 
     async def _reload_via_address_bar(self, page: Page, human: HumanInteractor) -> None:
-        """Перезагрузка через адресную строку (как человек)."""
-        # Ctrl+L → фокус на адресную строку
-        await page.keyboard.press("Control+l")
-        await human.random_pause(0.3, 0.7)
-        await page.keyboard.press("Enter")
-        await human.random_pause(2.0, 4.0)
+        """
+        Перезагрузка страницы.
+
+        Раньше здесь был page.keyboard.press("Control+l") + Enter — но
+        page.keyboard шлёт события В СТРАНИЦУ, а не в хром браузера.
+        Адресная строка не фокусировалась, зато Instagram получал
+        посторонний Ctrl+L keydown на своей странице. Чистый минус.
+        """
+        await human.random_pause(0.8, 2.0)
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+        except Exception as e:
+            logger.debug("[%s] Reload failed: %s", human.username, e)
+        await human.random_pause(1.5, 3.5)
 
     # ── Cookie/GDPR попап ─────────────────────────────────────────────────
 
